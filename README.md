@@ -38,9 +38,9 @@ The plugin is a standard ONLYOFFICE plugin folder. To install it manually:
 
 ## Development
 
-The plugin loads its OCR models, the ONNX Runtime Web runtime and the Khmer
-segmenter with relative HTTP requests, so it must be served over HTTP(S) — not
-opened from `file://`.
+The plugin loads its OCR models, the ONNX Runtime Web runtime and pdf.js with
+relative HTTP requests, so it must be served over HTTP(S) — not opened from
+`file://`.
 
 ```bash
 # from the repository root
@@ -60,18 +60,14 @@ vendor/pdf-lib.min.js    PDF writer (pdf-lib 1.17.1)
 vendor/pdfjs/            page rasterizer (pdf.js 4.10.38)
 assets/                  TypsastraLogical.ttf (Type0 descriptor source)
 worker/
-  ocr-worker.js          web worker: detection, recognition, segmentation
+  ocr-worker.js          web worker: detection and recognition
   models/                PP-OCRv6 detector (tiny) + AOU-CTC int8 recognizer + vocab
-  wasm/                  Khmer segmenter (WASM)
-  data/                  Khmer dictionary
   vendor/ort/            ONNX Runtime Web 1.23.2 (wasm execution provider)
 resources/               plugin + store icons, store screenshots
-licenses/                third-party licenses for the bundled OCR assets
 ```
 
 Pipeline: PDF page image → PP-OCRv6 tiny detector → DB post-processing →
-perspective crop → AOU-CTC int8 recognizer → Khmer Viterbi segmentation → review →
-PLU text layer.
+perspective crop → AOU-CTC int8 recognizer → review → PLU text layer.
 
 Page count and page sizes are read with the public Document Builder API
 (`Asc.plugin.callCommand`); no patched editor build is required.
@@ -85,8 +81,6 @@ Bundled third-party software and data:
 | [pdf-lib](https://github.com/Hopding/pdf-lib) | 1.17.1 | MIT |
 | [pdf.js](https://github.com/mozilla/pdf.js) | 4.10.38 | Apache-2.0 |
 | [onnxruntime-web](https://github.com/microsoft/onnxruntime) | 1.23.2 | MIT |
-| [khmer_segmenter](https://github.com/Sovichea/khmer_segmenter) | 0.2.0 | see `licenses/khmer_segmenter_LICENSE` |
-| Khmer dictionary (`khmer_dictionary.kdict`) | 0.2.0 | see `licenses/khmer_dictionary_LICENSE.md` |
 | TypsastraLogical.ttf | — | see `assets/` and `NOTICE` |
 
 See [NOTICE](NOTICE) for details.

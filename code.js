@@ -531,9 +531,6 @@
 					"Recognizing line " + (message.completed || 0) + " of " + (message.total || 0) + "…"
 				);
 				break;
-			case "segmenting":
-				setPageProgress(0.99, "Finalizing page…");
-				break;
 			case "page-ready": {
 				var waiter = state.pageWaiters[message.requestId];
 				if (waiter) {

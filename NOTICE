@@ -28,18 +28,6 @@ ONNX Runtime Web 1.23.2
   Source: https://github.com/microsoft/onnxruntime
 
 -------------------------------------------------------------------------------
-khmer_segmenter 0.2.0
-  Files: worker/wasm/khmer_segmenter.js,
-         worker/wasm/khmer_segmenter_bg.wasm
-  License: see licenses/khmer_segmenter_LICENSE
-  Source: https://github.com/Sovichea/khmer_segmenter
-
--------------------------------------------------------------------------------
-Khmer dictionary (khmer_dictionary.kdict)
-  Files: worker/data/khmer_dictionary.kdict
-  License: see licenses/khmer_dictionary_LICENSE.md
-
--------------------------------------------------------------------------------
 OCR models
   Files: worker/models/detector_tiny.onnx,
          worker/models/recognizer-int8.onnx,

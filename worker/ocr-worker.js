@@ -74,10 +74,6 @@ function loadJson(url) {
     return JSON.parse(new TextDecoder("utf-8").decode(bytes));
   });
 }
-var SEGMENTER_VERSION = "0.2.0";
-var SEGMENTER_COMMIT = "d52f302fabadbde9107acd0e28362a8d40af10ed";
-var SEGMENTER_WASM_SHA256 = "43ab0ebbabe6aea477b07dedd3746dbd55925d3328b7b2dc806d40b4d5f6f994";
-var SEGMENTER_DICTIONARY_SHA256 = "32d4cfdc1568c4764e198fa613041d4f80c8055f4cd203f4efa0872d644709dd";
 var ortLoaded = false;
 var hardwareConcurrency = self.navigator && self.navigator.hardwareConcurrency || 1;
 var workerParameters = new URL(self.location.href).searchParams;
@@ -175,16 +171,12 @@ var DEFAULT_CONFIG = Object.freeze({
   cropPaddingLeftPixels: 0,
   cropPaddingRightPixels: 5,
   lineMergeGapRatio: 1.0,
-  segmenterProfile: "typing",
-  segmenterAccuracy: "visual",
-  maxSuggestions: 8
 });
 
 var config = copyConfig(DEFAULT_CONFIG);
 var detectorSession = null;
 var recognizerSession = null;
 var vocabulary = null;
-var khmerSegmenter = null;
 var initialized = false;
 
 var requestSequence = 0;
@@ -277,7 +269,7 @@ async function handleMessage(message, requestId, page, pageId) {
 }
 
 /**
- * Load the detector, selected recognizer, vocabulary, and pinned Khmer segmenter pack.
+ * Load the detector, recognizer and vocabulary.
  * @param {Object<string, *>|undefined} overrides
  * @param {Object<string, *>|undefined} runtimeOverrides
  * @param {*} requestId
@@ -339,8 +331,6 @@ async function initialize(overrides, runtimeOverrides, requestId) {
     detectorSession = nextDetector;
     recognizerSession = nextRecognizer;
     vocabulary = nextVocabulary;
-    // The Khmer segmenter is optional: it only adds lexical diagnostics and
-    // correction suggestions. Detection and recognition work without it.
     initialized = true;
   } catch (error) {
     safeDispose(nextDetector);
@@ -366,44 +356,8 @@ async function initialize(overrides, runtimeOverrides, requestId) {
       threads: wasmThreadCount,
       crossOriginIsolated: Boolean(self.crossOriginIsolated)
     },
-    segmenter: {
-      version: SEGMENTER_VERSION,
-      commit: SEGMENTER_COMMIT,
-      languagePack: "inclusive-pilot"
-    },
     config: copyConfig(config)
   });
-}
-
-async function initializeKhmerSegmenter() {
-  var moduleUrl = resourceUrl("wasm/khmer_segmenter.js");
-  var wasmUrl = resourceUrl("wasm/khmer_segmenter_bg.wasm");
-  var dictionaryUrl = resourceUrl("data/khmer_dictionary.kdict");
-  var buildInfoUrl = resourceUrl("SEGMENTER_BUILD_INFO.json");
-
-  var resources = await Promise.all([
-    loadArrayBuffer(wasmUrl),
-    loadArrayBuffer(dictionaryUrl),
-    loadJson(buildInfoUrl),
-    import(moduleUrl)
-  ]);
-
-  var wasmBytes = resources[0];
-  var dictionaryBytes = resources[1];
-  var buildInfo = resources[2];
-  assertSegmenterBuild(buildInfo);
-  await Promise.all([
-    assertSha256(wasmBytes, SEGMENTER_WASM_SHA256, "segmenter WASM"),
-    assertSha256(dictionaryBytes, SEGMENTER_DICTIONARY_SHA256, "segmenter dictionary")
-  ]);
-
-  var segmenterModule = resources[3];
-  if (!segmenterModule || typeof segmenterModule.default !== "function" ||
-      typeof segmenterModule.WasmKhmerSegmenter !== "function") {
-    throw new Error("wasm/khmer_segmenter.js does not expose the expected WASM API");
-  }
-  await segmenterModule.default({ module_or_path: wasmBytes });
-  return new segmenterModule.WasmKhmerSegmenter(dictionaryBytes);
 }
 
 async function fetchModelManifest(url) {
@@ -435,221 +389,6 @@ function validatedRuntimeConfig(overrides) {
   return { int8Threads: requestedWasmThreads };
 }
 
-function assertSegmenterBuild(buildInfo) {
-  if (!buildInfo || buildInfo.segmenter_commit !== SEGMENTER_COMMIT || buildInfo.release_line !== SEGMENTER_VERSION) {
-    throw new Error("SEGMENTER_BUILD_INFO.json does not match Khmer segmenter " + SEGMENTER_VERSION +
-      " at commit " + SEGMENTER_COMMIT);
-  }
-  var artifacts = buildInfo.artifacts || {};
-  var wasmHash = artifacts["wasm/khmer_segmenter_bg.wasm"] &&
-    artifacts["wasm/khmer_segmenter_bg.wasm"].sha256;
-  var dictionaryHash = artifacts["data/khmer_dictionary.kdict"] &&
-    artifacts["data/khmer_dictionary.kdict"].sha256;
-  if (wasmHash !== SEGMENTER_WASM_SHA256 || dictionaryHash !== SEGMENTER_DICTIONARY_SHA256) {
-    throw new Error("SEGMENTER_BUILD_INFO.json contains unexpected artifact hashes");
-  }
-}
-
-async function assertSha256(bytes, expected, label) {
-  if (!self.crypto || !self.crypto.subtle) {
-    // Web Crypto is unavailable in non-secure contexts (for example the file://
-    // pages used by the desktop app). Skip the pinned-hash check there; the
-    // bytes still come from the plugin's own asset folder.
-    return;
-  }
-  var digest = new Uint8Array(await self.crypto.subtle.digest("SHA-256", bytes));
-  var actual = "";
-  for (var i = 0; i < digest.length; i++) actual += digest[i].toString(16).padStart(2, "0");
-  if (actual !== expected) {
-    throw new Error(label + " SHA-256 mismatch; expected " + expected + ", received " + actual);
-  }
-}
-
-/**
- * Run Viterbi segmentation and spelling diagnostics without changing raw OCR.
- * Every issue retains UTF-16 source offsets and is projected onto CTC alignment
- * and line geometry for review/export consumers.
- */
-function analyzeRecognizedLine(line) {
-  if (!khmerSegmenter) {
-    return {
-      profile: config.segmenterProfile,
-      accuracy: config.segmenterAccuracy,
-      segments: [],
-      diagnostics: [],
-      suggestions: []
-    };
-  }
-  var result = khmerSegmenter.analyzeWithOptions(
-    line.rawText,
-    config.segmenterProfile,
-    config.segmenterAccuracy
-  ) || {};
-  var segments = Array.isArray(result.segments) ? result.segments.map(copyLexicalSegment) : [];
-  var diagnostics = Array.isArray(result.diagnostics) ? result.diagnostics.map(copyDiagnostic) : [];
-
-  for (var i = 0; i < segments.length; i++) {
-    var segment = segments[i];
-    if (!segment.isUnknown && segment.spellingValid !== false) continue;
-    var sourceStart = lexicalOffset(segment, "sourceStart", "start", 0);
-    var sourceEnd = lexicalOffset(segment, "sourceEnd", "end", sourceStart);
-    var covered = diagnostics.some(function (diagnostic) {
-      return sourceEnd > diagnostic.sourceStart && sourceStart < diagnostic.sourceEnd;
-    });
-    if (!covered) {
-      diagnostics.push({
-        text: line.rawText.slice(sourceStart, sourceEnd),
-        start: segment.start,
-        end: segment.end,
-        sourceStart: sourceStart,
-        sourceEnd: sourceEnd,
-        kind: "unknown_word",
-        confidence: 0,
-        suggestions: []
-      });
-    }
-  }
-
-  diagnostics.sort(function (a, b) { return a.sourceStart - b.sourceStart || a.sourceEnd - b.sourceEnd; });
-  var lineSuggestions = [];
-  for (var d = 0; d < diagnostics.length; d++) {
-    var diagnostic = diagnostics[d];
-    if (!diagnostic.suggestions.length && diagnostic.text) {
-      diagnostic.suggestions = copySuggestions(khmerSegmenter.suggestWithAccuracy(
-        diagnostic.text,
-        config.maxSuggestions,
-        config.segmenterAccuracy
-      ));
-    }
-    diagnostic.alignment = alignSourceSpan(line, diagnostic.sourceStart, diagnostic.sourceEnd);
-    for (var s = 0; s < diagnostic.suggestions.length; s++) {
-      var replacement = diagnostic.suggestions[s];
-      if (!replacement.text || replacement.text === diagnostic.text) continue;
-      var fullText = line.rawText.slice(0, diagnostic.sourceStart) + replacement.text +
-        line.rawText.slice(diagnostic.sourceEnd);
-      var score = correctionScore(diagnostic.confidence, replacement.editCost);
-      lineSuggestions.push({
-        text: fullText,
-        replacement: replacement.text,
-        score: score,
-        editCost: replacement.editCost,
-        source: "lexicon",
-        kind: diagnostic.kind,
-        sourceStart: diagnostic.sourceStart,
-        sourceEnd: diagnostic.sourceEnd,
-        alignment: diagnostic.alignment
-      });
-    }
-  }
-
-  lineSuggestions.sort(function (a, b) { return b.score - a.score || a.editCost - b.editCost; });
-  var seen = Object.create(null);
-  lineSuggestions = lineSuggestions.filter(function (suggestion) {
-    if (seen[suggestion.text]) return false;
-    seen[suggestion.text] = true;
-    return true;
-  });
-
-  return {
-    profile: config.segmenterProfile,
-    accuracy: config.segmenterAccuracy,
-    segments: segments,
-    diagnostics: diagnostics,
-    suggestions: lineSuggestions.slice(0, config.maxSuggestions)
-  };
-}
-
-function copyLexicalSegment(segment) {
-  return {
-    word: String(segment.word || ""),
-    start: lexicalOffset(segment, "start", "sourceStart", 0),
-    end: lexicalOffset(segment, "end", "sourceEnd", 0),
-    sourceStart: lexicalOffset(segment, "sourceStart", "start", 0),
-    sourceEnd: lexicalOffset(segment, "sourceEnd", "end", 0),
-    isUnknown: Boolean(segment.isUnknown),
-    spellingValid: segment.spellingValid !== false
-  };
-}
-
-function copyDiagnostic(diagnostic) {
-  var sourceStart = lexicalOffset(diagnostic, "sourceStart", "start", 0);
-  var sourceEnd = lexicalOffset(diagnostic, "sourceEnd", "end", sourceStart);
-  return {
-    text: String(diagnostic.text || ""),
-    start: lexicalOffset(diagnostic, "start", "sourceStart", sourceStart),
-    end: lexicalOffset(diagnostic, "end", "sourceEnd", sourceEnd),
-    sourceStart: sourceStart,
-    sourceEnd: sourceEnd,
-    kind: String(diagnostic.kind || "spelling"),
-    confidence: Number.isFinite(diagnostic.confidence) ? diagnostic.confidence : 0,
-    suggestions: copySuggestions(diagnostic.suggestions)
-  };
-}
-
-function copySuggestions(suggestions) {
-  if (!Array.isArray(suggestions)) return [];
-  return suggestions.slice(0, config.maxSuggestions).map(function (suggestion) {
-    return {
-      text: String(suggestion.text || ""),
-      editCost: Number.isFinite(suggestion.editCost)
-        ? suggestion.editCost
-        : Number.isFinite(suggestion.cost) ? suggestion.cost : 0
-    };
-  });
-}
-
-function lexicalOffset(value, preferred, fallback, defaultValue) {
-  var offset = value && Number.isInteger(value[preferred]) ? value[preferred]
-    : value && Number.isInteger(value[fallback]) ? value[fallback] : defaultValue;
-  return Math.max(0, offset);
-}
-
-function correctionScore(confidence, editCost) {
-  var issueConfidence = Number.isFinite(confidence) && confidence > 0 ? confidence : 0.5;
-  var cost = Number.isFinite(editCost) && editCost >= 0 ? editCost : 1;
-  return issueConfidence / (1 + cost);
-}
-
-function alignSourceSpan(line, sourceStart, sourceEnd) {
-  var cursor = 0;
-  var first = -1;
-  var last = -1;
-  for (var i = 0; i < line.units.length; i++) {
-    var next = cursor + line.units[i].rawText.length;
-    if (next > sourceStart && cursor < sourceEnd) {
-      if (first < 0) first = i;
-      last = i;
-    }
-    cursor = next;
-  }
-  if (first < 0) return null;
-  var timestepStart = line.units[first].timestepStart;
-  var timestepEnd = line.units[last].timestepEnd;
-  var totalTimesteps = line.units.length ? line.units[line.units.length - 1].timestepEnd : 0;
-  return {
-    unitStart: first,
-    unitEnd: last + 1,
-    timestepStart: timestepStart,
-    timestepEnd: timestepEnd,
-    quad: subQuadForTimesteps(line.quad, timestepStart, timestepEnd, totalTimesteps)
-  };
-}
-
-function subQuadForTimesteps(quad, start, end, total) {
-  if (!total) return quad;
-  var left = clamp(start / total, 0, 1);
-  var right = clamp(end / total, left, 1);
-  return {
-    p0: interpolatePoint(quad.p0, quad.p1, left),
-    p1: interpolatePoint(quad.p0, quad.p1, right),
-    p2: interpolatePoint(quad.p3, quad.p2, right),
-    p3: interpolatePoint(quad.p3, quad.p2, left)
-  };
-}
-
-function interpolatePoint(a, b, ratio) {
-  return { x: a.x + (b.x - a.x) * ratio, y: a.y + (b.y - a.y) * ratio };
-}
 
 /**
  * Detect and recognize one RGBA page.
@@ -745,30 +484,6 @@ async function recognizeDetections(rgba, width, height, detections, requestId, p
       averageInferenceMs: totalInferenceMs / (i + 1)
     });
   }
-
-  postEvent("page-state", requestId, page, pageId, { state: "segmenting" });
-  postEvent("segmenting", requestId, page, pageId, {
-    completed: 0,
-    total: lines.length,
-    progress: lines.length ? 0 : 1
-  });
-  var issueCount = 0;
-  var suggestionCount = 0;
-  for (var lineIndex = 0; lineIndex < lines.length; lineIndex++) {
-    lines[lineIndex].lexical = analyzeRecognizedLine(lines[lineIndex]);
-    issueCount += lines[lineIndex].lexical.diagnostics.length;
-    suggestionCount += lines[lineIndex].lexical.suggestions.length;
-    postEvent("segmenting", requestId, page, pageId, {
-      completed: lineIndex + 1,
-      total: lines.length,
-      progress: (lineIndex + 1) / lines.length,
-      detectionId: lines[lineIndex].detectionId
-    });
-  }
-  postEvent("suggestions-ready", requestId, page, pageId, {
-    issues: issueCount,
-    suggestions: suggestionCount
-  });
 
   postEvent("page-state", requestId, page, pageId, { state: "ready" });
   postEvent("page-ready", requestId, page, pageId, {
@@ -1591,9 +1306,6 @@ function validatedConfig(overrides) {
   setConfigNumber(result, source, "cropPaddingLeftPixels", 0, 1024, false);
   setConfigNumber(result, source, "cropPaddingRightPixels", 0, 1024, false);
   setConfigNumber(result, source, "lineMergeGapRatio", 0, 4, false);
-  setConfigNumber(result, source, "maxSuggestions", 1, 20, true);
-  setConfigChoice(result, source, "segmenterProfile", ["typing", "dictionary"]);
-  setConfigChoice(result, source, "segmenterAccuracy", ["visual", "lexical"]);
   result.recognizerMaxWidth = Math.max(4, Math.floor(result.recognizerMaxWidth / 4) * 4);
   return result;
 }
@@ -1641,9 +1353,6 @@ function copyConfig(source) {
     cropPaddingBottomRatio: source.cropPaddingBottomRatio,
     cropPaddingLeftPixels: source.cropPaddingLeftPixels,
     cropPaddingRightPixels: source.cropPaddingRightPixels,
-    segmenterProfile: source.segmenterProfile,
-    segmenterAccuracy: source.segmenterAccuracy,
-    maxSuggestions: source.maxSuggestions
   };
 }
 
