@@ -1,0 +1,38 @@
+{
+  "segmenter_repository": "https://github.com/Sovichea/khmer_segmenter",
+  "segmenter_commit": "d52f302fabadbde9107acd0e28362a8d40af10ed",
+  "segmenter_state": "pinned main commit plus locally prepared official and community layers",
+  "release_line": "0.2.0",
+  "language_pack": "inclusive-pilot",
+  "official_lexicon_layers": [
+    "geography-lexicon",
+    "science-lexicon",
+    "economic-lexicon",
+    "law-lexicon",
+    "mptc-lexicon"
+  ],
+  "author_curated_entries": 10,
+  "rac_derived_entries": 21,
+  "rac_usage_entries": 32,
+  "rac_phrase_segmentation_exclusions": 10,
+  "runtime_policy_counts": {
+    "records": 56181,
+    "segmentation": 54733,
+    "spelling": 38296,
+    "autocomplete": 38286
+  },
+  "community_corpus": {
+    "dataset": "Panhapich/khmer-text-corpus",
+    "revision": "e42e1dd0d77836f1874ad14e83f4e291e5bb0a01",
+    "approved_segmentation_entries": 126,
+    "corpus_weight": 0.2
+  },
+  "artifacts": {
+    "wasm/khmer_segmenter_bg.wasm": {
+      "sha256": "43ab0ebbabe6aea477b07dedd3746dbd55925d3328b7b2dc806d40b4d5f6f994"
+    },
+    "data/khmer_dictionary.kdict": {
+      "sha256": "32d4cfdc1568c4764e198fa613041d4f80c8055f4cd203f4efa0872d644709dd"
+    }
+  }
+}

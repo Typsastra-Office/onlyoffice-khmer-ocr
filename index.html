@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en" style="height:100%;">
+<head>
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+    <meta charset="utf-8" />
+    <title>Khmer OCR</title>
+    <link rel="stylesheet" href="ui.css" />
+    <script type="text/javascript" src="https://onlyoffice.github.io/sdkjs-plugins/v1/plugins.js"></script>
+    <script type="text/javascript" src="vendor/pdf-lib.min.js"></script>
+</head>
+<body>
+    <div id="app">
+        <header class="bar">
+            <div class="bar-row">
+                <div class="brand">
+                    <span class="brand-name">Khmer OCR</span>
+                    <span class="brand-sub">local recognition &amp; PLU export</span>
+                </div>
+                <div class="engine" id="engine" title="OCR engine status">
+                    <span class="dot" id="engine-dot"></span>
+                    <span id="engine-text">starting engine…</span>
+                </div>
+            </div>
+            <div class="bar-row actions">
+                <button type="button" class="btn primary" id="btn-run" disabled>Run OCR</button>
+                <button type="button" class="btn" id="btn-save" disabled>Save as PLU PDF</button>
+                <button type="button" class="btn ghost" id="btn-clear" disabled>Clear</button>
+            </div>
+            <div class="bar-row options">
+                <label class="opt" for="opt-threads">
+                    <span>Threads</span>
+                    <select id="opt-threads">
+                        <option value="1">1</option>
+                        <option value="2">2</option>
+                        <option value="3">3</option>
+                        <option value="4" selected>4</option>
+                        <option value="5">5</option>
+                        <option value="6">6</option>
+                        <option value="7">7</option>
+                        <option value="8">8</option>
+                    </select>
+                </label>
+                <div class="segmented" id="opt-view" role="group" aria-label="Result view">
+                    <button type="button" class="seg active" data-view="lines">Lines</button>
+                    <button type="button" class="seg" data-view="page">Page</button>
+                </div>
+            </div>
+            <div class="progress" id="progress-wrap" hidden>
+                <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+                <div class="progress-text" id="progress-text"></div>
+            </div>
+        </header>
+
+        <div class="toolbar" id="toolbar" hidden>
+            <label class="summary" id="summary"></label>
+            <div class="toolbar-buttons">
+                <button type="button" class="link" id="btn-accept-all">Accept all</button>
+                <button type="button" class="link" id="btn-reject-all">Reject all</button>
+            </div>
+        </div>
+
+        <main class="content" id="content">
+            <div class="empty" id="empty">
+                <p class="empty-title">No OCR result yet</p>
+                <p class="empty-body">Open a PDF, then press <b>Run OCR</b>. Recognition runs entirely on this computer. Review each recognized line and reject the ones that are wrong. Editing is disabled in this version.</p>
+            </div>
+            <div class="pages" id="pages"></div>
+        </main>
+
+        <footer class="statusbar">
+            <span id="status-text">Ready</span>
+            <span class="note">Text on rejected lines is left out of the exported PLU text layer.</span>
+        </footer>
+    </div>
+
+    <script type="text/javascript" src="code.js"></script>
+</body>
+</html>

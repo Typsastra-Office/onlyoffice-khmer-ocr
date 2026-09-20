@@ -1,0 +1,19 @@
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Build output
+dist/
+build/
+*.zip
+*.plugin
+
+# Local tooling
+.vscode/
+.idea/

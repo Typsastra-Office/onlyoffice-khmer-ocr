@@ -1,0 +1,48 @@
+Khmer OCR for ONLYOFFICE
+Copyright (C) 2026 Typsastra
+
+This product includes third-party software and data. The full license texts for
+components that require attribution are provided in the `licenses/` directory
+and/or next to this file.
+
+-------------------------------------------------------------------------------
+pdf-lib 1.17.1
+  Files: vendor/pdf-lib.min.js
+  Copyright (c) 2019 Andrew Dillon
+  License: MIT
+  Source: https://github.com/Hopding/pdf-lib
+
+-------------------------------------------------------------------------------
+ONNX Runtime Web 1.23.2
+  Files: worker/vendor/ort/ort.min.js, worker/vendor/ort/ort-wasm-simd-threaded.js,
+         worker/vendor/ort/ort-wasm-simd-threaded.wasm
+  Copyright (c) Microsoft Corporation
+  License: MIT
+  Source: https://github.com/microsoft/onnxruntime
+
+-------------------------------------------------------------------------------
+khmer_segmenter 0.2.0
+  Files: worker/wasm/khmer_segmenter.js,
+         worker/wasm/khmer_segmenter_bg.wasm
+  License: see licenses/khmer_segmenter_LICENSE
+  Source: https://github.com/Sovichea/khmer_segmenter
+
+-------------------------------------------------------------------------------
+Khmer dictionary (khmer_dictionary.kdict)
+  Files: worker/data/khmer_dictionary.kdict
+  License: see licenses/khmer_dictionary_LICENSE.md
+
+-------------------------------------------------------------------------------
+OCR models
+  Files: worker/models/detector_tiny.onnx,
+         worker/models/recognizer-int8.onnx,
+         worker/models/vocab.json
+  Trained by Typsastra for Khmer document recognition (PP-OCRv6-style detector,
+  AOU-CTC mixed-script recognizer).
+
+-------------------------------------------------------------------------------
+TypsastraLogical.ttf
+  Files: assets/TypsastraLogical.ttf
+  Provided by Typsastra. Used only as the embedded descriptor font for the
+  invisible Type0/CID text layer; the visual appearance of exported pages comes
+  from the raster page image.

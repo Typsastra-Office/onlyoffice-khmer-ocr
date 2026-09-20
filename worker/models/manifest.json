@@ -1,0 +1,18 @@
+{
+  "version": 2,
+  "assets": {
+    "detector_tiny.onnx": {
+      "bytes": 1780590,
+      "sha256": "193bab7a04fca699a6c82e6abb5b81bdb28177f0abd4062552b04908dafb19f8"
+    },
+    "recognizer-int8.onnx": {
+      "bytes": 12420060,
+      "sha256": "4950467a0a500079642583f156ffae0ef6958854efce8c4f60be3ce8cda9621f"
+    },
+    "vocab.json": {
+      "bytes": 54648,
+      "sha256": "15e8683efb712961fe90da71a3a828094def0c3dd934b9713c159310ae5e633c"
+    }
+  },
+  "models": {}
+}

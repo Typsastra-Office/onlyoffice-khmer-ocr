@@ -1,0 +1,76 @@
+{
+    "name": "Khmer OCR",
+    "nameLocale": {
+        "ru": "Khmer OCR",
+        "fr": "Khmer OCR",
+        "es": "Khmer OCR",
+        "de": "Khmer OCR"
+    },
+    "guid": "asc.{0E5BEC1D-C728-46E1-9876-2BFD7E980F40}",
+
+    "variations": [
+        {
+            "description": "Recognize Khmer text in the open PDF locally, review the result line by line, reject the wrong lines and export a searchable Unicode (PLU) PDF. Text editing is disabled.",
+            "descriptionLocale": {
+                "ru": "Распознавайте кхмерский текст в открытом PDF локально, проверяйте результат построчно, отклоняйте неверные строки и экспортируйте PDF с поисковым Unicode-текстом (PLU). Редактирование текста отключено.",
+                "fr": "Reconnaissez le texte khmer du PDF ouvert localement, vérifiez le résultat ligne par ligne, rejetez les lignes incorrectes et exportez un PDF Unicode (PLU) consultable. L'édition du texte est désactivée.",
+                "es": "Reconozca el texto jemer del PDF abierto localmente, revise el resultado línea por línea, rechace las líneas incorrectas y exporte un PDF Unicode (PLU) con búsqueda. La edición de texto está desactivada.",
+                "de": "Erkennen Sie Khmer-Text im geöffneten PDF lokal, prüfen Sie das Ergebnis Zeile für Zeile, verwerfen Sie falsche Zeilen und exportieren Sie ein durchsuchbares Unicode-PDF (PLU). Die Textbearbeitung ist deaktiviert."
+            },
+            "url": "index.html",
+
+            "icons": [
+                {
+                    "style": "light",
+                    "100%": { "normal": "resources/light/icon.png" },
+                    "125%": { "normal": "resources/light/icon@1.25x.png" },
+                    "150%": { "normal": "resources/light/icon@1.5x.png" },
+                    "175%": { "normal": "resources/light/icon@1.75x.png" },
+                    "200%": { "normal": "resources/light/icon@2x.png" }
+                },
+                {
+                    "style": "dark",
+                    "100%": { "normal": "resources/dark/icon.png" },
+                    "125%": { "normal": "resources/dark/icon@1.25x.png" },
+                    "150%": { "normal": "resources/dark/icon@1.5x.png" },
+                    "175%": { "normal": "resources/dark/icon@1.75x.png" },
+                    "200%": { "normal": "resources/dark/icon@2x.png" }
+                }
+            ],
+
+            "isViewer": true,
+            "isDisplayedInViewer": true,
+            "EditorsSupport": ["pdf"],
+
+            "type": "panel",
+            "isVisual": true,
+            "isModal": false,
+            "isInsideMode": true,
+
+            "initDataType": "none",
+            "initData": "",
+
+            "isUpdateOleOnResize": false,
+
+            "buttons": [],
+
+            "events": [],
+
+            "store": {
+                "background": {
+                    "light": "#F5F7FA",
+                    "dark": "#1F2229"
+                },
+                "screenshots": [
+                    "resources/store/screenshots/screen_1.png",
+                    "resources/store/screenshots/screen_2.png"
+                ],
+                "icons": {
+                    "light": "resources/store/icons",
+                    "dark": "resources/store/icons"
+                },
+                "categories": ["work"]
+            }
+        }
+    ]
+}
