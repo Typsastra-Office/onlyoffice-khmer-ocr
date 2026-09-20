@@ -15,10 +15,10 @@ OCR runs entirely on the user's machine. No document content is uploaded anywher
   exported text layer.
 - **Editing disabled**: this version only supports accept/reject, not manual text
   editing.
-- **Save as PLU PDF**: produces a PDF whose pages keep their appearance as a raster
-  image plus an invisible `Type0`/`CIDFontType2` Unicode text layer with exact
-  per-chunk `ToUnicode` mappings, so Khmer text is selectable, searchable and
-  copyable.
+- **Save as PLU PDF**: adds an invisible `Type0`/`CIDFontType2` Unicode text layer
+  with exact per-chunk `ToUnicode` mappings to the **original PDF pages**, so the
+  document keeps its original quality and the Khmer text becomes selectable,
+  searchable and copyable.
 
 ## Requirements
 
@@ -55,8 +55,9 @@ python -m http.server 8080
 config.json              ONLYOFFICE plugin manifest
 index.html               panel entry point
 ui.css                   panel styling
-code.js                  panel UI, review state, PLU export (pdf-lib)
+code.js                  panel UI, review state, page rendering, PLU export
 vendor/pdf-lib.min.js    PDF writer (pdf-lib 1.17.1)
+vendor/pdfjs/            page rasterizer (pdf.js 4.10.38)
 assets/                  TypsastraLogical.ttf (Type0 descriptor source)
 worker/
   ocr-worker.js          web worker: detection, recognition, segmentation
@@ -82,6 +83,7 @@ Bundled third-party software and data:
 | Component | Version | License |
 | --- | --- | --- |
 | [pdf-lib](https://github.com/Hopding/pdf-lib) | 1.17.1 | MIT |
+| [pdf.js](https://github.com/mozilla/pdf.js) | 4.10.38 | Apache-2.0 |
 | [onnxruntime-web](https://github.com/microsoft/onnxruntime) | 1.23.2 | MIT |
 | [khmer_segmenter](https://github.com/Sovichea/khmer_segmenter) | 0.2.0 | see `licenses/khmer_segmenter_LICENSE` |
 | Khmer dictionary (`khmer_dictionary.kdict`) | 0.2.0 | see `licenses/khmer_dictionary_LICENSE.md` |

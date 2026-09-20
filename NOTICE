@@ -6,6 +6,13 @@ components that require attribution are provided in the `licenses/` directory
 and/or next to this file.
 
 -------------------------------------------------------------------------------
+pdf.js (pdfjs-dist) 4.10.38, legacy build
+  Files: vendor/pdfjs/pdf.min.js, vendor/pdfjs/pdf.worker.min.js
+  Copyright (c) Mozilla Foundation
+  License: Apache-2.0
+  Source: https://github.com/mozilla/pdf.js
+
+-------------------------------------------------------------------------------
 pdf-lib 1.17.1
   Files: vendor/pdf-lib.min.js
   Copyright (c) 2019 Andrew Dillon

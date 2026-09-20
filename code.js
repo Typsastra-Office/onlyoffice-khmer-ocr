@@ -39,7 +39,11 @@
 		status: "Ready",
 		previewMode: "lines",
 		threads: 4,
-		effectiveThreads: 0
+		effectiveThreads: 0,
+		pdfjs: null,
+		pdfjsPromise: null,
+		rendererError: "",
+		usedPdfJs: false
 	};
 
 	var el = {};
@@ -70,6 +74,12 @@
 		el.engine.classList.remove("is-ready", "is-busy", "is-error");
 		if (kind) el.engine.classList.add("is-" + kind);
 		if (text != null) el.engineText.textContent = text;
+	}
+
+	function setNotice(text) {
+		if (!el.notice) return;
+		el.notice.hidden = !text;
+		el.notice.textContent = text || "";
 	}
 
 	function updateButtons() {
@@ -499,12 +509,218 @@
 
 	/* -------------------------------------------------------------- OCR driver */
 
+	function loadPdfJs() {
+		if (state.pdfjsPromise) return state.pdfjsPromise;
+		state.pdfjsPromise = loadText(resourceUrl("vendor/pdfjs/pdf.min.js"))
+			.then(function (source) {
+				// The desktop ascdesktop:// scheme does not return a JavaScript MIME
+				// type for these files, which module loading requires. Read the
+				// source ourselves and import it from a Blob module instead.
+				var moduleUrl = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+				return import(moduleUrl);
+			})
+			.then(function (module) {
+				var pdfjs = module;
+				state.pdfjs = pdfjs;
+				return loadText(resourceUrl("vendor/pdfjs/pdf.worker.min.js")).then(function (workerText) {
+					try {
+						var workerUrl = URL.createObjectURL(new Blob([workerText], { type: "text/javascript" }));
+						pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
+						pdfjs.GlobalWorkerOptions.workerPort = new Worker(workerUrl, { type: "module" });
+					} catch (error) {
+						// pdf.js falls back to its own worker handling.
+					}
+					return pdfjs;
+				});
+			})
+			.catch(function (error) {
+				state.pdfjsPromise = null;
+				throw error;
+			});
+		return state.pdfjsPromise;
+	}
+
+	/**
+	 * Prefer rendering pages from the original PDF with pdf.js — the same
+	 * renderer the reference app uses. The editor's GetPageImage returns a
+	 * horizontally squished, low-resolution raster that blurs the OCR input.
+	 */
+	/**
+	 * Desktop-only route: the app exposes the source path of the open document
+	 * and serves local files over the ascdesktop:// scheme, so the original bytes
+	 * can be read directly without triggering a save dialog.
+	 */
+	function desktopOriginalBytes() {
+		try {
+			var desktop = window.AscDesktopEditor;
+			if (!desktop || typeof desktop.LocalFileGetSourcePath !== "function") {
+				return Promise.resolve(null);
+			}
+			var path = desktop.LocalFileGetSourcePath();
+			if (!path) return Promise.resolve(null);
+			path = String(path).replace(/\\/g, "/");
+			if (path.indexOf("file:///") === 0) path = path.substring(8);
+			if (path.charAt(0) === "/" && /^\/[A-Za-z]:/.test(path)) path = path.substring(1);
+			return loadBinaryAsset("ascdesktop://fonts/" + path).then(function (bytes) {
+				return bytes && bytes.length > 4 ? bytes : null;
+			}).catch(function () {
+				return null;
+			});
+		} catch (error) {
+			return Promise.resolve(null);
+		}
+	}
+
+	/**
+	 * Web route: the editor exports the document to a URL. Only used outside the
+	 * desktop app, where this can raise a native save dialog.
+	 */
+	function webOriginalBytes() {
+		if (window.AscDesktopEditor) return Promise.resolve(null);
+		return pluginMethod("GetFileToDownload", ["pdf"]).then(function (url) {
+			if (typeof url !== "string" || !url || url === "error") return null;
+			return loadBinaryAsset(url).then(function (bytes) {
+				return bytes && bytes.length > 4 ? bytes : null;
+			}).catch(function () {
+				return null;
+			});
+		}).catch(function () {
+			return null;
+		});
+	}
+
+	function probeBytesAccess() {
+		var local = [];
+		try {
+			var desktop = window.AscDesktopEditor;
+			local.push("desktop:" + (desktop ? "yes" : "no"));
+			local.push("sourcePath:" + (desktop && typeof desktop.LocalFileGetSourcePath === "function"
+				? String(desktop.LocalFileGetSourcePath() || "") : "n/a"));
+		} catch (error) {
+			local.push("desktop:err");
+		}
+		return callCommand(function () {
+			var report = [];
+			try { report.push("g_asc_plugins:" + (typeof g_asc_plugins)); } catch (error) { report.push("g_asc_plugins:err"); }
+			try { report.push("Asc:" + (typeof Asc)); } catch (error) {}
+			try {
+				var plugins = (typeof g_asc_plugins !== "undefined") ? g_asc_plugins : null;
+				var viewer = plugins && plugins.api && plugins.api.DocumentRenderer;
+				report.push("viewer:" + (viewer ? "yes" : "no"));
+				report.push("getFileNativeBinary:" + (viewer && typeof viewer.getFileNativeBinary));
+			} catch (error) { report.push("viewer:err"); }
+			try {
+				var doc = Api.GetDocument();
+				report.push("doc.Document:" + (doc && doc.Document ? "yes" : "no"));
+				var file = (doc && doc.Document && doc.Document.GetFile) ? doc.Document.GetFile() : null;
+				report.push("file:" + (file ? "yes" : "no"));
+				report.push("file.getFileBinary:" + (file && typeof file.getFileBinary));
+			} catch (error) { report.push("builder:err"); }
+			return report.join(",");
+		}).then(function (report) {
+			return local.join(",") + " | " + (typeof report === "string" ? report : "n/a");
+		}).catch(function () {
+			return local.join(",") + " | command failed";
+		});
+	}
+
+	function createPdfJsRenderer(sizes) {
+		state.rendererError = "";
+		var commandError = "";
+		return readOriginalPdfBytes()
+			.then(function (result) {
+				if (result.bytes) return result.bytes;
+				commandError = result.error || "no bytes";
+				return desktopOriginalBytes();
+			})
+			.then(function (bytes) {
+				if (bytes) return bytes;
+				return webOriginalBytes();
+			})
+			.then(function (bytes) {
+				if (!bytes) throw new Error("original PDF bytes unavailable (" + commandError + ")");
+				return loadPdfJs().then(function (pdfjs) {
+					return pdfjs.getDocument({ data: bytes }).promise.then(function (pdfDocument) {
+						return {
+							kind: "pdf.js",
+							render: function (index) { return renderPdfJsPage(pdfDocument, index, sizes); },
+							destroy: function () { try { pdfDocument.destroy(); } catch (error) {} }
+						};
+					});
+				});
+			})
+			.catch(function (error) {
+				state.rendererError = (error && error.message) ? error.message : String(error);
+				console.warn("pdf.js rendering unavailable, using the editor raster", error);
+				return probeBytesAccess().then(function (report) {
+					state.rendererError += " [" + report + "]";
+					return null;
+				});
+			});
+	}
+
+	function renderPdfJsPage(pdfDocument, index, sizes) {
+		return pdfDocument.getPage(index + 1).then(function (page) {
+			var initial = page.getViewport({ scale: 2 });
+			var scale = Math.min(1, RASTER_MAX_SIDE / Math.max(initial.width, initial.height));
+			var viewport = page.getViewport({ scale: 2 * scale });
+			var width = Math.max(1, Math.round(viewport.width));
+			var height = Math.max(1, Math.round(viewport.height));
+			var canvas = document.createElement("canvas");
+			canvas.width = width;
+			canvas.height = height;
+			var context = canvas.getContext("2d");
+			context.fillStyle = "#ffffff";
+			context.fillRect(0, 0, width, height);
+			return page.render({ canvasContext: context, viewport: viewport }).promise.then(function () {
+				var data = context.getImageData(0, 0, width, height).data;
+				var rgba = new Uint8ClampedArray(width * height * 4);
+				rgba.set(data);
+				var size = sizes && sizes[index] ? sizes[index] : null;
+				page.cleanup();
+				return {
+					width: width,
+					height: height,
+					rgba: rgba.buffer,
+					dataUrl: canvas.toDataURL("image/png"),
+					pdfWidth: size && size.width ? size.width : width * 0.75,
+					pdfHeight: size && size.height ? size.height : height * 0.75,
+					editorSize: size || null
+				};
+			});
+		});
+	}
+
+	function renderEditorPage(index, sizes) {
+		var size = sizes && sizes[index] ? sizes[index] : null;
+		var expectedAspect = size && size.width && size.height ? (size.width / size.height) : null;
+		return pluginMethod("GetPageImage", [index, { maxSize: RASTER_MAX_SIDE }]).then(function (dataUrl) {
+			if (typeof dataUrl !== "string" || dataUrl.indexOf("data:") !== 0) {
+				throw new Error("Editor returned no image for page " + (index + 1));
+			}
+			return decodeDataUrl(dataUrl, expectedAspect).then(function (decoded) {
+				return {
+					width: decoded.width,
+					height: decoded.height,
+					rgba: decoded.rgba,
+					dataUrl: decoded.dataUrl,
+					pdfWidth: size && size.width ? size.width : decoded.width * 0.75,
+					pdfHeight: size && size.height ? size.height : decoded.height * 0.75,
+					editorSize: size || null
+				};
+			});
+		});
+	}
+
 	function runOcr() {
 		if (state.running) return;
 		state.running = true;
 		updateButtons();
 		setProgress(0, "Preparing…");
 		setStatus("Preparing…");
+		setNotice("");
+
+		var activeRenderer = null;
 
 		ensureWorker()
 			.then(function () {
@@ -518,17 +734,37 @@
 				state.pages = [];
 				renderPages();
 
-				var chain = Promise.resolve();
-				for (var index = 0; index < pageCount; index++) {
-					chain = chain.then(function (pageIndex) {
-						return processPage(pageIndex, pageCount, info.sizes);
-					}.bind(null, index));
-				}
-				return chain;
+				return createPdfJsRenderer(info.sizes).then(function (renderer) {
+					state.usedPdfJs = !!renderer;
+					activeRenderer = renderer || {
+						kind: "editor",
+						render: function (index) { return renderEditorPage(index, info.sizes); },
+						destroy: function () {}
+					};
+					setEngine("ready", "engine ready · " + activeRenderer.kind);
+					if (!renderer) {
+						var reason = state.rendererError || "unknown";
+						setStatus("pdf.js unavailable (" + reason + "); using the editor raster.");
+						setNotice("High-quality rendering unavailable: " + reason +
+							". Recognition is using the editor raster, which is lower resolution.");
+					} else {
+						setNotice("");
+					}
+
+					var chain = Promise.resolve();
+					for (var index = 0; index < pageCount; index++) {
+						chain = chain.then(function (pageIndex) {
+							return processPage(pageIndex, pageCount, activeRenderer);
+						}.bind(null, index));
+					}
+					return chain;
+				});
 			})
 			.then(function () {
 				setProgress(1, "OCR finished");
-				setStatus("OCR finished. Review the lines, then save as PLU PDF.");
+				setStatus("OCR finished" + (state.usedPdfJs ? "" :
+					" (editor raster: " + (state.rendererError || "unknown") + ")") +
+					". Review the lines, then save as PLU PDF.");
 				updateButtons();
 				window.setTimeout(function () { setProgress(null); }, 1500);
 			})
@@ -538,29 +774,21 @@
 				setProgress(null);
 			})
 			.then(function () {
+				if (activeRenderer) activeRenderer.destroy();
 				state.running = false;
 				updateButtons();
 			});
 	}
 
-	function processPage(pageIndex, pageCount, sizes) {
-		var base = pageIndex / pageCount;
-		setProgress(base, "Reading page " + (pageIndex + 1) + " of " + pageCount + "…");
+	function processPage(pageIndex, pageCount, renderer) {
+		setProgress(pageIndex / pageCount, "Reading page " + (pageIndex + 1) + " of " + pageCount + "…");
 		setStatus("Reading page " + (pageIndex + 1) + " of " + pageCount + "…");
 
-		var size = sizes && sizes[pageIndex] ? sizes[pageIndex] : null;
-		var expectedAspect = size && size.width && size.height ? (size.width / size.height) : null;
-		var image;
-		return pluginMethod("GetPageImage", [pageIndex, { maxSize: RASTER_MAX_SIDE }])
-			.then(function (dataUrl) {
-				if (typeof dataUrl !== "string" || dataUrl.indexOf("data:") !== 0) {
-					throw new Error("Editor returned no image for page " + (pageIndex + 1));
-				}
-				return decodeDataUrl(dataUrl, expectedAspect);
-			})
-			.then(function (decoded) {
-				image = decoded;
-				return ocrPage(pageIndex, image);
+		var image = null;
+		return renderer.render(pageIndex)
+			.then(function (rendered) {
+				image = rendered;
+				return ocrPage(pageIndex, rendered);
 			})
 			.then(function (message) {
 				var lines = (message.lines || []).map(function (line) {
@@ -575,16 +803,15 @@
 					height: heightPx,
 					imageUrl: image.dataUrl,
 					imageBytes: dataUrlToBytes(image.dataUrl),
-					pdfWidth: size && size.width ? size.width : widthPx * 0.75,
-					pdfHeight: size && size.height ? size.height : heightPx * 0.75,
-					editorSize: size || null,
+					pdfWidth: image.pdfWidth,
+					pdfHeight: image.pdfHeight,
+					editorSize: image.editorSize,
+					renderKind: renderer.kind,
 					lines: lines,
 					error: null
 				});
 				setStatus("Page " + (pageIndex + 1) + ": raster " + widthPx + "×" + heightPx +
-					", editor " + (size && size.rawWidth != null ? size.rawWidth : "?") + "×" +
-					(size && size.rawHeight != null ? size.rawHeight : "?") +
-					" dpi " + (size && size.dpi != null ? size.dpi : "?"));
+					" · " + lines.length + " lines · " + renderer.kind);
 				renderPages();
 			});
 	}
@@ -699,10 +926,7 @@
 		meta.className = "page-meta";
 		var metaParts = [page.lines.length + " line" + (page.lines.length === 1 ? "" : "s")];
 		if (page.width && page.height) metaParts.push("raster " + page.width + "×" + page.height);
-		if (page.editorSize && page.editorSize.rawWidth != null) {
-			metaParts.push("editor " + Math.round(page.editorSize.rawWidth) + "×" +
-				Math.round(page.editorSize.rawHeight) + " @" + page.editorSize.dpi + "dpi");
-		}
+		if (page.renderKind) metaParts.push(page.renderKind);
 		meta.textContent = metaParts.join(" · ");
 
 		head.appendChild(caret);
@@ -938,7 +1162,12 @@
 
 		return {
 			ref: ref,
-			cidFor: function (chunk) { return PDFHexString.of(cidHex(cidById.get(chunk.id))); }
+			cidFor: function (chunk) { return PDFHexString.of(cidHex(cidById.get(chunk.id))); },
+			cidsFor: function (chunks) {
+				return PDFHexString.of(chunks.map(function (chunk) {
+					return cidHex(cidById.get(chunk.id));
+				}).join(""));
+			}
 		};
 	}
 
@@ -973,22 +1202,13 @@
 		return hex.toUpperCase();
 	}
 
-	function logicalChunkQuad(quad, start, end) {
-		function interpolate(from, to, position) {
-			return {
-				x: from.x + (to.x - from.x) * position,
-				y: from.y + (to.y - from.y) * position
-			};
-		}
-		return {
-			p0: interpolate(quad.p0, quad.p1, start),
-			p1: interpolate(quad.p0, quad.p1, end),
-			p2: interpolate(quad.p3, quad.p2, end),
-			p3: interpolate(quad.p3, quad.p2, start)
-		};
-	}
-
-	function drawInvisibleLogicalChunkInQuad(page, fontKey, encodedCid, sourceQuad, sourcePage) {
+	/**
+	 * Draw one recognized line as a single invisible text run spanning the line
+	 * quad. Drawing the whole line in one text-showing operation (instead of one
+	 * operation per chunk) is what stops PDF viewers from inserting spaces
+	 * between chunks when the text is copied.
+	 */
+	function drawInvisibleLogicalLine(page, fontKey, encodedCids, sourceQuad, sourcePage, chunkCount) {
 		var PDFLib = window.PDFLib;
 		var quad = {};
 		Object.keys(sourceQuad).forEach(function (name) {
@@ -996,14 +1216,17 @@
 		});
 		var horizontal = { x: quad.p2.x - quad.p3.x, y: quad.p2.y - quad.p3.y };
 		var vertical = { x: quad.p0.x - quad.p3.x, y: quad.p0.y - quad.p3.y };
+		// Every CID advances exactly 1 em, so a font size of 1/chunkCount makes
+		// the run span exactly one text-space unit, i.e. the full line width.
+		var size = chunkCount > 0 ? 1 / chunkCount : 1;
 
 		page.pushOperators(
 			PDFLib.pushGraphicsState(),
 			PDFLib.beginText(),
 			PDFLib.setTextRenderingMode(PDFLib.TextRenderingMode.Invisible),
-			PDFLib.setFontAndSize(fontKey, 1),
+			PDFLib.setFontAndSize(fontKey, size),
 			PDFLib.setTextMatrix(horizontal.x, horizontal.y, vertical.x, vertical.y, quad.p3.x, quad.p3.y),
-			PDFLib.showText(encodedCid),
+			PDFLib.showText(encodedCids),
 			PDFLib.endText(),
 			PDFLib.popGraphicsState()
 		);
@@ -1065,6 +1288,155 @@
 		}, 2000);
 	}
 
+	function base64ToBytes(base64) {
+		var binary = atob(base64);
+		var bytes = new Uint8Array(binary.length);
+		for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+		return bytes;
+	}
+
+	/**
+	 * Ask the editor for the original PDF bytes. Keeping the original page
+	 * content (vector text, images) preserves the document quality; flattening
+	 * the pages to the OCR raster does not. Returns null when unreachable, in
+	 * which case the export falls back to the raster pages.
+	 */
+	function readOriginalPdfBytes() {
+		return callCommand(function () {
+			function toBase64(bytes) {
+				var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+				var out = [];
+				var length = bytes.length;
+				for (var i = 0; i < length; i += 3) {
+					var c1 = bytes[i];
+					var c2 = i + 1 < length ? bytes[i + 1] : 0;
+					var c3 = i + 2 < length ? bytes[i + 2] : 0;
+					out.push(chars.charAt(c1 >> 2));
+					out.push(chars.charAt(((c1 & 3) << 4) | (c2 >> 4)));
+					out.push(i + 1 < length ? chars.charAt(((c2 & 15) << 2) | (c3 >> 6)) : "=");
+					out.push(i + 2 < length ? chars.charAt(c3 & 63) : "=");
+				}
+				return out.join("");
+			}
+			function toByteArray(value) {
+				if (!value) return null;
+				if (typeof value === "string") {
+					var arr = new Uint8Array(value.length);
+					for (var i = 0; i < value.length; i++) arr[i] = value.charCodeAt(i) & 0xff;
+					return arr;
+				}
+				if (typeof Uint8Array !== "undefined" && value instanceof Uint8Array) return value;
+				if (typeof ArrayBuffer !== "undefined" && value instanceof ArrayBuffer) return new Uint8Array(value);
+				if (value.buffer && typeof value.byteLength === "number") {
+					return new Uint8Array(value.buffer, value.byteOffset || 0, value.byteLength);
+				}
+				return null;
+			}
+
+			try {
+				var raw = null;
+				try {
+					var plugins = (typeof g_asc_plugins !== "undefined") ? g_asc_plugins : null;
+					var api = plugins && plugins.api;
+					var viewer = api && api.DocumentRenderer;
+					if (viewer && typeof viewer.getFileNativeBinary === "function") {
+						raw = viewer.getFileNativeBinary();
+					}
+				} catch (error1) {}
+				try {
+					if (!raw) {
+						var ascEditor = (typeof Asc !== "undefined") ? Asc.editor : null;
+						var viewer2 = ascEditor && ascEditor.DocumentRenderer;
+						if (viewer2 && typeof viewer2.getFileNativeBinary === "function") {
+							raw = viewer2.getFileNativeBinary();
+						}
+					}
+				} catch (error2) {}
+				try {
+					if (!raw) {
+						var file = Api.GetDocument().Document.GetFile();
+						if (file && typeof file.getFileBinary === "function") raw = file.getFileBinary();
+					}
+				} catch (error3) {}
+
+				if (!raw) return "ERR:nobytes";
+				var bytes = toByteArray(raw);
+				if (!bytes || !bytes.length) {
+					return "ERR:type=" + (typeof raw) + ",len=" + (raw && raw.length);
+				}
+				return "OK:" + toBase64(bytes);
+			} catch (error) {
+				return "ERR:" + (error && error.message ? error.message : String(error));
+			}
+		}).then(function (result) {
+			if (typeof result !== "string" || !result) {
+				return { bytes: null, error: "no result from command" };
+			}
+			if (result.indexOf("OK:") === 0) {
+				try {
+					var bytes = base64ToBytes(result.substring(3));
+					return { bytes: bytes.length > 4 ? bytes : null, error: bytes.length > 4 ? "" : "empty bytes" };
+				} catch (error) {
+					return { bytes: null, error: "base64 decode failed" };
+				}
+			}
+			return { bytes: null, error: result };
+		}).catch(function () {
+			return { bytes: null, error: "callCommand failed" };
+		});
+	}
+
+	function buildRasterPdf(PDFLib) {
+		return PDFLib.PDFDocument.create().then(function (pdf) {
+			var chain = Promise.resolve();
+			state.pages.forEach(function (page, index) {
+				chain = chain.then(function () {
+					return pdf.embedPng(page.imageBytes).then(function (png) {
+						var width = page.pdfWidth || page.width;
+						var height = page.pdfHeight || page.height;
+						var pdfPage = pdf.addPage([width, height]);
+						pdfPage.drawImage(png, { x: 0, y: 0, width: width, height: height });
+						setProgress((index + 1) / state.pages.length * 0.4,
+							"Embedding page " + (index + 1) + " of " + state.pages.length + "…");
+					});
+				});
+			});
+			return chain.then(function () { return pdf; });
+		});
+	}
+
+	function applyTextLayer(pdf) {
+		var units = buildLogicalUnits();
+		state.logicalUnitCount = units.length;
+		if (!units.length) {
+			throw new Error("Nothing to export: every recognized line was rejected.");
+		}
+		return fetchAsset("assets/TypsastraLogical.ttf").then(function (fontBytes) {
+			var logicalFont = createPdfLogicalFont(pdf, units, fontBytes);
+			var fontKeys = new Map();
+			units.forEach(function (unit) {
+				var sourcePage = state.pages[unit.pageIndex];
+				var page = pdf.getPage(unit.pageIndex);
+				if (!page) return;
+				var fontKey = fontKeys.get(unit.pageIndex);
+				if (!fontKey) {
+					fontKey = page.node.newFontDictionary("TypsastraLogical", logicalFont.ref);
+					fontKeys.set(unit.pageIndex, fontKey);
+				}
+				drawInvisibleLogicalLine(
+					page,
+					fontKey,
+					logicalFont.cidsFor(unit.chunks),
+					unit.quad,
+					sourcePage,
+					unit.chunks.length
+				);
+			});
+			setMetadata(pdf);
+			return pdf;
+		});
+	}
+
 	function savePlu() {
 		if (state.running || !state.pages.length) return;
 		if (!window.PDFLib) {
@@ -1078,65 +1450,41 @@
 		setStatus("Building PLU PDF…");
 
 		var PDFLib = window.PDFLib;
-		var pdf;
+		var pdf = null;
+		var usedOriginal = false;
 
-		PDFLib.PDFDocument.create()
-			.then(function (created) {
-				pdf = created;
-				var chain = Promise.resolve();
-				state.pages.forEach(function (page, index) {
-					chain = chain.then(function () {
-						return pdf.embedPng(page.imageBytes).then(function (png) {
-							var width = page.pdfWidth || page.width;
-							var height = page.pdfHeight || page.height;
-							var pdfPage = pdf.addPage([width, height]);
-							pdfPage.drawImage(png, { x: 0, y: 0, width: width, height: height });
-							setProgress((index + 1) / state.pages.length * 0.5,
-								"Embedding page " + (index + 1) + " of " + state.pages.length + "…");
-						});
-					});
+		readOriginalPdfBytes()
+			.then(function (bytes) {
+				if (!bytes) return null;
+				setStatus("Adding text layer to the original PDF…");
+				return PDFLib.PDFDocument.load(bytes, { ignoreEncryption: true }).catch(function () {
+					return null;
 				});
-				return chain;
+			})
+			.then(function (loaded) {
+				if (loaded) {
+					pdf = loaded;
+					usedOriginal = true;
+					return pdf;
+				}
+				return buildRasterPdf(PDFLib).then(function (created) {
+					pdf = created;
+					return pdf;
+				});
 			})
 			.then(function () {
-				var units = buildLogicalUnits();
-				state.logicalUnitCount = units.length;
-				return fetchAsset("assets/TypsastraLogical.ttf").then(function (fontBytes) {
-					return { units: units, fontBytes: fontBytes };
-				});
+				return applyTextLayer(pdf);
 			})
-			.then(function (payload) {
-				if (!payload.units.length) {
-					throw new Error("Nothing to export: every recognized line was rejected.");
-				}
-				var logicalFont = createPdfLogicalFont(pdf, payload.units, payload.fontBytes);
-				var fontKeys = new Map();
-				payload.units.forEach(function (unit) {
-					var sourcePage = state.pages[unit.pageIndex];
-					var page = pdf.getPage(unit.pageIndex);
-					var fontKey = fontKeys.get(unit.pageIndex);
-					if (!fontKey) {
-						fontKey = page.node.newFontDictionary("TypsastraLogical", logicalFont.ref);
-						fontKeys.set(unit.pageIndex, fontKey);
-					}
-					unit.chunks.forEach(function (chunk) {
-						drawInvisibleLogicalChunkInQuad(
-							page,
-							fontKey,
-							logicalFont.cidFor(chunk),
-							logicalChunkQuad(unit.quad, chunk.start, chunk.end),
-							sourcePage
-						);
-					});
-				});
-				setMetadata(pdf);
+			.then(function () {
+				setProgress(0.85, "Saving…");
 				return pdf.save();
 			})
 			.then(function (bytes) {
 				saveBlob(bytes, documentName() + "-PLU.pdf");
 				setProgress(1, "PLU PDF ready");
-				setStatus("PLU PDF created: " + state.logicalUnitCount + " text line(s).");
-				window.setTimeout(function () { setProgress(null); }, 2000);
+				setStatus("PLU PDF created: " + state.logicalUnitCount + " line(s)" +
+					(usedOriginal ? ", original page quality kept." : "."));
+				window.setTimeout(function () { setProgress(null); }, 2500);
 			})
 			.catch(function (error) {
 				console.error(error);
@@ -1176,6 +1524,7 @@
 		el.empty = byId("empty");
 		el.statusText = byId("status-text");
 		el.content = byId("content");
+		el.notice = byId("notice");
 
 		if (el.btnRun) el.btnRun.addEventListener("click", runOcr);
 		if (el.btnSave) el.btnSave.addEventListener("click", savePlu);

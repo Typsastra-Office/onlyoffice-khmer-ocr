@@ -287,6 +287,23 @@ body {
     word-break: break-word;
 }
 
+/* ---------------------------------------------------------------- notice */
+
+.notice {
+    flex: 0 0 auto;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    background: #fff4d6;
+    color: #7a5200;
+    font-size: 13px;
+    word-break: break-word;
+}
+
+[data-theme="dark"] .notice {
+    background: #3a3018;
+    color: #f0d090;
+}
+
 /* ---------------------------------------------------------------- toolbar */
 
 .toolbar {
