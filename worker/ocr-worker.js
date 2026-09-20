@@ -174,6 +174,7 @@ var DEFAULT_CONFIG = Object.freeze({
   cropPaddingBottomRatio: 0.1,
   cropPaddingLeftPixels: 0,
   cropPaddingRightPixels: 5,
+  lineMergeGapRatio: 1.0,
   segmenterProfile: "typing",
   segmenterAccuracy: "visual",
   maxSuggestions: 8
@@ -683,6 +684,7 @@ async function processPage(message, requestId, page, pageId) {
     postEvent("page-state", requestId, page, pageId, { state: "detecting" });
     postEvent("detection-progress", requestId, page, pageId, { completed: 0, total: 1, progress: 0 });
     var detections = await detectPage(rgba, width, height);
+    detections = assignReadingOrder(mergeSameLineDetections(detections, config.lineMergeGapRatio));
     postEvent("detection-progress", requestId, page, pageId, {
       completed: 1,
       total: 1,
@@ -1109,6 +1111,74 @@ function heapBubbleDown(heap, index) {
  * @param {Detection[]} detections
  * @returns {Detection[]}
  */
+function detectionBounds(quad) {
+  var xs = [quad.p0.x, quad.p1.x, quad.p2.x, quad.p3.x];
+  var ys = [quad.p0.y, quad.p1.y, quad.p2.y, quad.p3.y];
+  return {
+    left: Math.min.apply(null, xs),
+    right: Math.max.apply(null, xs),
+    top: Math.min.apply(null, ys),
+    bottom: Math.max.apply(null, ys)
+  };
+}
+
+function quadFromBounds(bounds) {
+  return {
+    p0: { x: bounds.left, y: bounds.top },
+    p1: { x: bounds.right, y: bounds.top },
+    p2: { x: bounds.right, y: bounds.bottom },
+    p3: { x: bounds.left, y: bounds.bottom }
+  };
+}
+
+/**
+ * Merge detections that belong to the same visual line: strong vertical overlap
+ * and a small horizontal gap. A title whose first glyph is spaced away from the
+ * rest is otherwise split into two boxes, which produces two text runs and makes
+ * the word unsearchable.
+ */
+function mergeSameLineDetections(detections, gapRatio) {
+  var ratio = Number.isFinite(gapRatio) ? gapRatio : 1.0;
+  if (ratio <= 0) return detections;
+  var merged = detections.slice();
+  var changed = true;
+  while (changed) {
+    changed = false;
+    for (var i = 0; i < merged.length && !changed; i++) {
+      for (var j = i + 1; j < merged.length; j++) {
+        var a = merged[i];
+        var b = merged[j];
+        var ba = detectionBounds(a.quad);
+        var bb = detectionBounds(b.quad);
+        var ha = ba.bottom - ba.top;
+        var hb = bb.bottom - bb.top;
+        if (ha <= 0 || hb <= 0) continue;
+        var minHeight = Math.min(ha, hb);
+        var overlap = Math.min(ba.bottom, bb.bottom) - Math.max(ba.top, bb.top);
+        if (overlap < minHeight * 0.6) continue;
+        if (Math.max(ha, hb) / minHeight > 1.6) continue;
+        var gap = ba.left < bb.left ? (bb.left - ba.right) : (ba.left - bb.right);
+        if (gap > minHeight * ratio) continue;
+        merged[i] = {
+          id: Math.min(a.id, b.id),
+          quad: quadFromBounds({
+            left: Math.min(ba.left, bb.left),
+            right: Math.max(ba.right, bb.right),
+            top: Math.min(ba.top, bb.top),
+            bottom: Math.max(ba.bottom, bb.bottom)
+          }),
+          score: Math.max(a.score, b.score),
+          order: a.order
+        };
+        merged.splice(j, 1);
+        changed = true;
+        break;
+      }
+    }
+  }
+  return merged;
+}
+
 function assignReadingOrder(detections) {
   var items = detections.map(function (detection) {
     var ys = [detection.quad.p0.y, detection.quad.p1.y, detection.quad.p2.y, detection.quad.p3.y];
@@ -1520,6 +1590,7 @@ function validatedConfig(overrides) {
   setConfigNumber(result, source, "cropPaddingBottomRatio", 0, 2, false);
   setConfigNumber(result, source, "cropPaddingLeftPixels", 0, 1024, false);
   setConfigNumber(result, source, "cropPaddingRightPixels", 0, 1024, false);
+  setConfigNumber(result, source, "lineMergeGapRatio", 0, 4, false);
   setConfigNumber(result, source, "maxSuggestions", 1, 20, true);
   setConfigChoice(result, source, "segmenterProfile", ["typing", "dictionary"]);
   setConfigChoice(result, source, "segmenterAccuracy", ["visual", "lexical"]);

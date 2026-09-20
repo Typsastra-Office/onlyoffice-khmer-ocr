@@ -741,22 +741,31 @@
 			var context = canvas.getContext("2d");
 			context.fillStyle = "#ffffff";
 			context.fillRect(0, 0, width, height);
-			return page.render({ canvasContext: context, viewport: viewport }).promise.then(function () {
-				var data = context.getImageData(0, 0, width, height).data;
-				var rgba = new Uint8ClampedArray(width * height * 4);
-				rgba.set(data);
-				var size = sizes && sizes[index] ? sizes[index] : null;
-				page.cleanup();
-				return {
-					width: width,
-					height: height,
-					rgba: rgba.buffer,
-					dataUrl: canvas.toDataURL("image/png"),
-					pdfWidth: size && size.width ? size.width : width * 0.75,
-					pdfHeight: size && size.height ? size.height : height * 0.75,
-					editorSize: size || null
-				};
-			});
+			return page.render({ canvasContext: context, viewport: viewport }).promise
+				.then(function () {
+					return page.getTextContent().then(function (textContent) {
+						return pdfTextAnchors(textContent, viewport, state.pdfjs.Util);
+					}).catch(function () {
+						return [];
+					});
+				})
+				.then(function (anchors) {
+					var data = context.getImageData(0, 0, width, height).data;
+					var rgba = new Uint8ClampedArray(width * height * 4);
+					rgba.set(data);
+					var size = sizes && sizes[index] ? sizes[index] : null;
+					page.cleanup();
+					return {
+						width: width,
+						height: height,
+						rgba: rgba.buffer,
+						dataUrl: canvas.toDataURL("image/png"),
+						pdfWidth: size && size.width ? size.width : width * 0.75,
+						pdfHeight: size && size.height ? size.height : height * 0.75,
+						editorSize: size || null,
+						sourceTextAnchors: anchors
+					};
+				});
 		});
 	}
 
@@ -910,6 +919,7 @@
 					pdfHeight: image.pdfHeight,
 					editorSize: image.editorSize,
 					renderKind: renderer.kind,
+					sourceTextAnchors: image.sourceTextAnchors || [],
 					lines: lines,
 					error: null
 				});
@@ -954,6 +964,135 @@
 	function toggleReject(line) {
 		line.status = line.status === "rejected" ? "accepted" : "rejected";
 		renderPages();
+	}
+
+	function distanceToLine(point, start, end) {
+		var dx = end.x - start.x;
+		var dy = end.y - start.y;
+		var lengthSquared = dx * dx + dy * dy;
+		if (!lengthSquared) return Math.hypot(point.x - start.x, point.y - start.y);
+		var t = Math.max(0, Math.min(1, ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared));
+		return Math.hypot(point.x - (start.x + t * dx), point.y - (start.y + t * dy));
+	}
+
+	/**
+	 * Text anchors extracted from the PDF's own text via pdf.js (raster space).
+	 */
+	function pdfTextAnchors(textContent, viewport, pdfjsUtil) {
+		var items = (textContent && textContent.items) ? textContent.items : [];
+		var anchors = [];
+		for (var index = 0; index < items.length; index++) {
+			var item = items[index];
+			if (!item || !item.str || !Array.isArray(item.transform)) continue;
+			var matrix = pdfjsUtil.transform(viewport.transform, item.transform);
+			var horizontalLength = Math.hypot(matrix[0], matrix[1]);
+			var verticalLength = Math.hypot(matrix[2], matrix[3]);
+			if (!horizontalLength || !verticalLength) continue;
+			var axis = { x: matrix[0] / horizontalLength, y: matrix[1] / horizontalLength };
+			var width = Math.max(1, Math.abs(Number(item.width) || 0) * viewport.scale);
+			var height = Math.max(1, verticalLength);
+			var baselineStart = { x: matrix[4], y: matrix[5] };
+			var baselineEnd = { x: baselineStart.x + axis.x * width, y: baselineStart.y + axis.y * width };
+			var normal = { x: axis.y * height, y: -axis.x * height };
+			var quad = {
+				p0: { x: baselineStart.x + normal.x, y: baselineStart.y + normal.y },
+				p1: { x: baselineEnd.x + normal.x, y: baselineEnd.y + normal.y },
+				p2: baselineEnd,
+				p3: baselineStart
+			};
+			anchors.push({
+				id: index,
+				corruptText: item.str,
+				width: width,
+				height: height,
+				baselineStart: baselineStart,
+				baselineEnd: baselineEnd,
+				quad: quad,
+				bounds: quadBounds(quad)
+			});
+		}
+		return anchors;
+	}
+
+	/**
+	 * Snap an OCR line quad to the PDF's real text baseline/height. Without this
+	 * the invisible text sits on the recognizer's padded crop box, which is
+	 * taller and offset, so search highlights and selection are shifted.
+	 */
+	function pdfSemanticQuad(page, lineQuad) {
+		var anchors = (page && page.sourceTextAnchors) ? page.sourceTextAnchors : [];
+		if (!anchors.length) return lineQuad;
+
+		var lineBounds = quadBounds(lineQuad);
+		var lineHeight = Math.max(1, lineBounds.bottom - lineBounds.top);
+		var lineCenter = {
+			x: (lineQuad.p0.x + lineQuad.p1.x + lineQuad.p2.x + lineQuad.p3.x) / 4,
+			y: (lineQuad.p0.y + lineQuad.p1.y + lineQuad.p2.y + lineQuad.p3.y) / 4
+		};
+		var lineAxisVector = {
+			x: (lineQuad.p1.x - lineQuad.p0.x) + (lineQuad.p2.x - lineQuad.p3.x),
+			y: (lineQuad.p1.y - lineQuad.p0.y) + (lineQuad.p2.y - lineQuad.p3.y)
+		};
+		var lineAxisLength = Math.hypot(lineAxisVector.x, lineAxisVector.y) || 1;
+		var lineAxis = { x: lineAxisVector.x / lineAxisLength, y: lineAxisVector.y / lineAxisLength };
+
+		var best = null;
+		for (var i = 0; i < anchors.length; i++) {
+			var anchor = anchors[i];
+			var horizontalOverlap = Math.max(0, Math.min(lineBounds.right, anchor.bounds.right) -
+				Math.max(lineBounds.left, anchor.bounds.left));
+			var horizontalOverlapRatio = horizontalOverlap / Math.max(1, lineBounds.right - lineBounds.left);
+			var verticalOverlap = Math.max(0, Math.min(lineBounds.bottom, anchor.bounds.bottom) -
+				Math.max(lineBounds.top, anchor.bounds.top));
+			var baselineDistance = distanceToLine(lineCenter, anchor.baselineStart, anchor.baselineEnd);
+			var anchorAxisLength = Math.hypot(
+				anchor.baselineEnd.x - anchor.baselineStart.x,
+				anchor.baselineEnd.y - anchor.baselineStart.y
+			) || 1;
+			var axisCompatibility = Math.abs(
+				((anchor.baselineEnd.x - anchor.baselineStart.x) * lineAxis.x +
+					(anchor.baselineEnd.y - anchor.baselineStart.y) * lineAxis.y) / anchorAxisLength
+			);
+			if (horizontalOverlapRatio < 0.35 || axisCompatibility < Math.cos(Math.PI / 6) ||
+				(verticalOverlap <= 0 && baselineDistance > lineHeight * 1.5)) continue;
+			var score = verticalOverlap / lineHeight + horizontalOverlapRatio - baselineDistance / lineHeight;
+			if (!best || score > best.score) best = { anchor: anchor, score: score };
+		}
+		if (!best || best.score < 0.25) return lineQuad;
+
+		var matched = best.anchor;
+		var baselineStart = matched.baselineStart;
+		var baselineEnd = matched.baselineEnd;
+		var anchorDirection = { x: baselineEnd.x - baselineStart.x, y: baselineEnd.y - baselineStart.y };
+		if (anchorDirection.x * lineAxis.x + anchorDirection.y * lineAxis.y < 0) {
+			var swap = baselineStart;
+			baselineStart = baselineEnd;
+			baselineEnd = swap;
+		}
+		var axisLength = Math.hypot(baselineEnd.x - baselineStart.x, baselineEnd.y - baselineStart.y) || 1;
+		var axis = {
+			x: (baselineEnd.x - baselineStart.x) / axisLength,
+			y: (baselineEnd.y - baselineStart.y) / axisLength
+		};
+		var normal = { x: axis.y, y: -axis.x };
+		var ocrWidth = (Math.hypot(lineQuad.p1.x - lineQuad.p0.x, lineQuad.p1.y - lineQuad.p0.y) +
+			Math.hypot(lineQuad.p2.x - lineQuad.p3.x, lineQuad.p2.y - lineQuad.p3.y)) / 2;
+		var relative = { x: lineCenter.x - baselineStart.x, y: lineCenter.y - baselineStart.y };
+		var centerProjection = relative.x * axis.x + relative.y * axis.y;
+		var baselineCenter = {
+			x: baselineStart.x + axis.x * centerProjection,
+			y: baselineStart.y + axis.y * centerProjection
+		};
+		var halfWidth = ocrWidth / 2;
+		var height = Math.max(1, Math.min(matched.height, lineHeight * 1.5));
+		var p3 = { x: baselineCenter.x - axis.x * halfWidth, y: baselineCenter.y - axis.y * halfWidth };
+		var p2 = { x: baselineCenter.x + axis.x * halfWidth, y: baselineCenter.y + axis.y * halfWidth };
+		return {
+			p0: { x: p3.x + normal.x * height, y: p3.y + normal.y * height },
+			p1: { x: p2.x + normal.x * height, y: p2.y + normal.y * height },
+			p2: p2,
+			p3: p3
+		};
 	}
 
 	function buildPagePreview(page) {
@@ -1210,7 +1349,7 @@
 					pageIndex: pageIndex,
 					unicode: unicode,
 					chunks: chunks,
-					quad: line.alignmentQuad || line.quad
+					quad: pdfSemanticQuad(page, line.quad || line.alignmentQuad)
 				});
 			});
 		});
