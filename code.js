@@ -43,7 +43,10 @@
 		pdfjs: null,
 		pdfjsPromise: null,
 		rendererError: "",
-		usedPdfJs: false
+		usedPdfJs: false,
+		cancelRequested: false,
+		runBase: 0,
+		runSpan: 1
 	};
 
 	var el = {};
@@ -69,6 +72,16 @@
 		if (text != null) el.progressText.textContent = text;
 	}
 
+	/**
+	 * Progress within the page currently being processed, mapped onto the overall
+	 * run so the bar accumulates across pages.
+	 */
+	function setPageProgress(fraction, text) {
+		var base = state.runBase || 0;
+		var span = state.runSpan || 1;
+		setProgress(base + span * Math.max(0, Math.min(1, fraction)), text);
+	}
+
 	function setEngine(kind, text) {
 		if (!el.engine) return;
 		el.engine.classList.remove("is-ready", "is-busy", "is-error");
@@ -82,10 +95,66 @@
 		el.notice.textContent = text || "";
 	}
 
+	function copyTextFallback(text) {
+		try {
+			var area = document.createElement("textarea");
+			area.value = text;
+			area.setAttribute("readonly", "true");
+			area.style.position = "fixed";
+			area.style.top = "-1000px";
+			area.style.opacity = "0";
+			document.body.appendChild(area);
+			area.select();
+			document.execCommand("copy");
+			document.body.removeChild(area);
+			setStatus("Copied.");
+		} catch (error) {
+			setStatus("Copy failed.");
+		}
+	}
+
+	function copyText(text) {
+		if (!text) {
+			setStatus("Nothing to copy.");
+			return;
+		}
+		if (navigator.clipboard && navigator.clipboard.writeText) {
+			navigator.clipboard.writeText(text).then(function () {
+				setStatus("Copied.");
+			}).catch(function () {
+				copyTextFallback(text);
+			});
+			return;
+		}
+		copyTextFallback(text);
+	}
+
+	function pageText(page) {
+		return page.lines
+			.filter(function (line) { return line.status !== "rejected"; })
+			.map(function (line) { return line.rawText || ""; })
+			.join("\n");
+	}
+
+	function buildCopyButton(text, title) {
+		var button = document.createElement("button");
+		button.type = "button";
+		button.className = "copy";
+		button.textContent = "Copy";
+		button.title = title;
+		button.addEventListener("click", function (event) {
+			event.stopPropagation();
+			copyText(typeof text === "function" ? text() : text);
+		});
+		return button;
+	}
+
 	function updateButtons() {
 		var hasPages = state.pages.length > 0;
 		var busy = state.running;
 		if (el.btnRun) el.btnRun.disabled = busy || !state.workerReady;
+		if (el.btnRunPage) el.btnRunPage.disabled = busy || !state.workerReady;
+		if (el.btnStop) el.btnStop.hidden = !busy;
 		if (el.btnSave) el.btnSave.disabled = busy || !hasPages;
 		if (el.btnClear) el.btnClear.disabled = busy || !hasPages;
 		if (el.toolbar) el.toolbar.hidden = !hasPages;
@@ -454,16 +523,16 @@
 				}
 				break;
 			case "detection-progress":
-				setProgress(0.02 + 0.05 * (message.progress || 0), "Detecting text…");
+				setPageProgress(0, "Detecting text…");
 				break;
 			case "recognition-progress":
-				setProgress(
-					0.07 + 0.08 * (message.progress || 0),
+				setPageProgress(
+					message.progress || 0,
 					"Recognizing line " + (message.completed || 0) + " of " + (message.total || 0) + "…"
 				);
 				break;
 			case "segmenting":
-				setProgress(0.15 + 0.03 * (message.progress || 0), "Segmenting Khmer text…");
+				setPageProgress(0.99, "Finalizing page…");
 				break;
 			case "page-ready": {
 				var waiter = state.pageWaiters[message.requestId];
@@ -712,26 +781,53 @@
 		});
 	}
 
-	function runOcr() {
+	function runAllPages() { runOcr("all"); }
+	function runCurrentPage() { runOcr("current"); }
+
+	function stopOcr() {
+		if (!state.running) return;
+		state.cancelRequested = true;
+		setStatus("Stopping after the current page…");
+		updateButtons();
+	}
+
+	function runOcr(scope) {
 		if (state.running) return;
 		state.running = true;
+		state.cancelRequested = false;
 		updateButtons();
 		setProgress(0, "Preparing…");
 		setStatus("Preparing…");
 		setNotice("");
 
 		var activeRenderer = null;
+		var info = null;
+		var indices = [];
 
 		ensureWorker()
 			.then(function () {
 				return readDocumentInfo();
 			})
-			.then(function (info) {
+			.then(function (documentInfo) {
+				info = documentInfo;
 				var pageCount = Number(info.count);
 				if (!Number.isFinite(pageCount) || pageCount <= 0) {
 					throw new Error("Could not determine the number of pages");
 				}
-				state.pages = [];
+				if (scope === "current") {
+					return pluginMethod("GetCurrentPage", []).then(function (current) {
+						var index = Number(current);
+						if (!Number.isFinite(index) || index < 0 || index >= pageCount) index = 0;
+						indices = [index];
+					});
+				}
+				for (var i = 0; i < pageCount; i++) indices.push(i);
+			})
+			.then(function () {
+				// Drop stale results for the pages about to be processed.
+				state.pages = state.pages.filter(function (page) {
+					return indices.indexOf(page.index) === -1;
+				});
 				renderPages();
 
 				return createPdfJsRenderer(info.sizes).then(function (renderer) {
@@ -744,27 +840,31 @@
 					setEngine("ready", "engine ready · " + activeRenderer.kind);
 					if (!renderer) {
 						var reason = state.rendererError || "unknown";
-						setStatus("pdf.js unavailable (" + reason + "); using the editor raster.");
 						setNotice("High-quality rendering unavailable: " + reason +
 							". Recognition is using the editor raster, which is lower resolution.");
 					} else {
 						setNotice("");
 					}
 
+					var total = indices.length;
 					var chain = Promise.resolve();
-					for (var index = 0; index < pageCount; index++) {
-						chain = chain.then(function (pageIndex) {
-							return processPage(pageIndex, pageCount, activeRenderer);
-						}.bind(null, index));
-					}
+					indices.forEach(function (pageIndex, position) {
+						chain = chain.then(function () {
+							if (state.cancelRequested) return null;
+							return processPage(pageIndex, position, total, activeRenderer);
+						});
+					});
 					return chain;
 				});
 			})
 			.then(function () {
-				setProgress(1, "OCR finished");
-				setStatus("OCR finished" + (state.usedPdfJs ? "" :
-					" (editor raster: " + (state.rendererError || "unknown") + ")") +
-					". Review the lines, then save as PLU PDF.");
+				if (state.cancelRequested) {
+					setProgress(1, "Stopped");
+					setStatus("OCR stopped.");
+				} else {
+					setProgress(1, "OCR finished");
+					setStatus("OCR finished. Review the lines, then save as PLU PDF.");
+				}
 				updateButtons();
 				window.setTimeout(function () { setProgress(null); }, 1500);
 			})
@@ -776,13 +876,16 @@
 			.then(function () {
 				if (activeRenderer) activeRenderer.destroy();
 				state.running = false;
+				state.cancelRequested = false;
 				updateButtons();
 			});
 	}
 
-	function processPage(pageIndex, pageCount, renderer) {
-		setProgress(pageIndex / pageCount, "Reading page " + (pageIndex + 1) + " of " + pageCount + "…");
-		setStatus("Reading page " + (pageIndex + 1) + " of " + pageCount + "…");
+	function processPage(pageIndex, position, total, renderer) {
+		state.runBase = position / Math.max(1, total);
+		state.runSpan = 1 / Math.max(1, total);
+		setPageProgress(0, "Rendering page " + (pageIndex + 1) + "…");
+		setStatus("Rendering page " + (pageIndex + 1) + "…");
 
 		var image = null;
 		return renderer.render(pageIndex)
@@ -810,6 +913,8 @@
 					lines: lines,
 					error: null
 				});
+				state.pages.sort(function (a, b) { return a.index - b.index; });
+				setPageProgress(1, "Page " + (pageIndex + 1) + ": " + lines.length + " lines");
 				setStatus("Page " + (pageIndex + 1) + ": raster " + widthPx + "×" + heightPx +
 					" · " + lines.length + " lines · " + renderer.kind);
 				renderPages();
@@ -855,12 +960,6 @@
 		var wrap = document.createElement("div");
 		wrap.className = "page-preview";
 
-		var image = document.createElement("img");
-		image.className = "page-img";
-		image.src = page.imageUrl;
-		image.alt = "Page " + (page.index + 1);
-		wrap.appendChild(image);
-
 		var combined = document.createElement("div");
 		combined.className = "page-text";
 		combined.setAttribute("dir", "ltr");
@@ -870,6 +969,20 @@
 			.join("\n");
 		wrap.appendChild(combined);
 		return wrap;
+	}
+
+	/**
+	 * Ask the editor to scroll to the recognized line. Coordinates are converted
+	 * from the OCR raster space to PDF points. A two-element rect scrolls with the
+	 * current zoom; a four-element rect would zoom to fit the line.
+	 */
+	function goToLine(page, line) {
+		if (!line.quad || !page.pdfWidth || !page.pdfHeight || !page.width || !page.height) return;
+		var bounds = quadBounds(line.quad);
+		var left = bounds.left / page.width * page.pdfWidth;
+		// GoToPage measures `top` downwards from the top of the page.
+		var top = bounds.top / page.height * page.pdfHeight;
+		pluginMethod("GoToPage", [page.index, [left, top]]).catch(function () {});
 	}
 
 	function toggleLineCrop(page, line, row) {
@@ -932,6 +1045,8 @@
 		head.appendChild(caret);
 		head.appendChild(title);
 		head.appendChild(meta);
+		head.appendChild(buildCopyButton(function () { return pageText(page); },
+			"Copy this page's recognized text"));
 		head.addEventListener("click", function () {
 			section.classList.toggle("collapsed");
 		});
@@ -967,9 +1082,9 @@
 		text.textContent = line.rawText || "";
 		// Editing is disabled on purpose: the text is display-only.
 		text.setAttribute("aria-readonly", "true");
-		text.title = "Click to show the pixels the recognizer used";
+		text.title = "Click to jump to this line in the editor";
 		text.addEventListener("click", function () {
-			toggleLineCrop(page, line, row);
+			goToLine(page, line);
 		});
 
 		var meta = document.createElement("div");
@@ -977,9 +1092,13 @@
 
 		var confidence = document.createElement("span");
 		confidence.className = "conf";
+		confidence.title = "Click to show the pixels the recognizer used";
 		var value = Number(line.confidence);
 		if (Number.isFinite(value) && value < REVIEW_CONFIDENCE) confidence.classList.add("low");
 		confidence.textContent = formatConfidence(line.confidence);
+		confidence.addEventListener("click", function () {
+			toggleLineCrop(page, line, row);
+		});
 
 		var reject = document.createElement("button");
 		reject.type = "button";
@@ -991,6 +1110,8 @@
 		});
 
 		meta.appendChild(confidence);
+		meta.appendChild(buildCopyButton(function () { return line.rawText || ""; },
+			"Copy this line's text"));
 		meta.appendChild(reject);
 		row.appendChild(text);
 		row.appendChild(meta);
@@ -1516,6 +1637,8 @@
 		el.progressFill = byId("progress-fill");
 		el.progressText = byId("progress-text");
 		el.btnRun = byId("btn-run");
+		el.btnRunPage = byId("btn-run-page");
+		el.btnStop = byId("btn-stop");
 		el.btnSave = byId("btn-save");
 		el.btnClear = byId("btn-clear");
 		el.toolbar = byId("toolbar");
@@ -1526,7 +1649,9 @@
 		el.content = byId("content");
 		el.notice = byId("notice");
 
-		if (el.btnRun) el.btnRun.addEventListener("click", runOcr);
+		if (el.btnRun) el.btnRun.addEventListener("click", runAllPages);
+		if (el.btnRunPage) el.btnRunPage.addEventListener("click", runCurrentPage);
+		if (el.btnStop) el.btnStop.addEventListener("click", stopOcr);
 		if (el.btnSave) el.btnSave.addEventListener("click", savePlu);
 		if (el.btnClear) el.btnClear.addEventListener("click", clearAll);
 		if (byId("btn-accept-all")) byId("btn-accept-all").addEventListener("click", function () { setAllLines("accepted"); });
@@ -1588,7 +1713,7 @@
 	// Expose for manual debugging from the plugin console.
 	window.KhmerOcrPlugin = {
 		state: state,
-		run: runOcr,
+		run: runAllPages,
 		save: savePlu,
 		clear: clearAll
 	};

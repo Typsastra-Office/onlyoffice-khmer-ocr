@@ -218,14 +218,6 @@ body {
     padding: 8px;
 }
 
-.page-img {
-    display: block;
-    width: 100%;
-    height: auto;
-    border: 1px solid var(--border);
-    background: #ffffff;
-}
-
 .page-text {
     font-family: var(--khmer-font);
     font-size: 15px;
@@ -445,6 +437,11 @@ body {
     line-height: 1.6;
     overflow-wrap: anywhere;
     white-space: pre-wrap;
+    cursor: pointer;
+}
+
+.line-text:hover {
+    text-decoration: underline;
 }
 
 .line.rejected .line-text {
@@ -464,6 +461,12 @@ body {
     color: var(--text-soft);
     font-size: 13px;
     font-variant-numeric: tabular-nums;
+    cursor: pointer;
+}
+
+.conf:hover {
+    color: var(--text);
+    text-decoration: underline;
 }
 
 .conf.low {
@@ -487,6 +490,25 @@ body {
     background: var(--danger);
     border-color: var(--danger);
     color: #ffffff;
+}
+
+.copy {
+    appearance: none;
+    border: 1px solid var(--border);
+    background: var(--bg-soft);
+    color: var(--text-soft);
+    border-radius: 3px;
+    font: inherit;
+    font-size: 13px;
+    padding: 2px 6px;
+    cursor: pointer;
+    white-space: nowrap;
+    flex: 0 0 auto;
+}
+
+.copy:hover {
+    background: var(--bg-sunken);
+    color: var(--text);
 }
 
 /* --------------------------------------------------------------- statusbar */
