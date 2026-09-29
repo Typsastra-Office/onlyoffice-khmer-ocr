@@ -800,7 +800,7 @@
 
 	function runOcr(scope) {
 		if (state.running) return;
-		pluginMethod("SetOcrLineHighlight", [null, null]).catch(function () {});
+		pluginMethod("SetTextHighlight", [null, null]).catch(function () {});
 		state.running = true;
 		state.cancelRequested = false;
 		updateButtons();
@@ -1124,7 +1124,7 @@
 		var bottom = bounds.bottom / page.height * page.pdfHeight;
 		return pluginMethod("GoToPage", [page.index, [left, top]])
 			.then(function () {
-				return pluginMethod("SetOcrLineHighlight", [page.index, [left, top, right, bottom]]);
+				return pluginMethod("SetTextHighlight", [page.index, [left, top, right, bottom]]);
 			})
 			.catch(function (error) {
 				setStatus("Could not highlight line: " + (error && error.message ? error.message : String(error)));
@@ -1272,7 +1272,7 @@
 	}
 
 	function clearAll() {
-		pluginMethod("SetOcrLineHighlight", [null, null]).catch(function () {});
+		pluginMethod("SetTextHighlight", [null, null]).catch(function () {});
 		state.pages = [];
 		renderPages();
 		setStatus("Ready");
@@ -1847,7 +1847,7 @@
 
 	window.Asc.plugin.button = function () {
 		var plugin = this;
-		pluginMethod("SetOcrLineHighlight", [null, null]).catch(function () {}).then(function () {
+		pluginMethod("SetTextHighlight", [null, null]).catch(function () {}).then(function () {
 			plugin.executeCommand("close", "");
 		});
 	};
