@@ -1117,16 +1117,28 @@
 	 */
 	function goToLine(page, line) {
 		if (!line.quad || !page.pdfWidth || !page.pdfHeight || !page.width || !page.height) return;
+		setStatus("Showing detected line on page " + (page.index + 1) + "…");
 		var bounds = quadBounds(line.quad);
 		var left = bounds.left / page.width * page.pdfWidth;
 		var top = bounds.top / page.height * page.pdfHeight;
 		var right = bounds.right / page.width * page.pdfWidth;
 		var bottom = bounds.bottom / page.height * page.pdfHeight;
-		return pluginMethod("GoToPage", [page.index, [left, top]])
-			.then(function () {
-				return pluginMethod("SetTextHighlight", [page.index, [left, top, right, bottom]]);
+		var pending = setTimeout(function () {
+			setStatus("Highlight API did not respond; check the editor console.");
+		}, 4000);
+		return pluginMethod("SetTextHighlight", [page.index, [left, top, right, bottom]])
+			.then(function (result) {
+				clearTimeout(pending);
+				if (result !== true) {
+					setStatus("Text highlight API result: " + String(result) + ".");
+				} else {
+					setStatus("Highlight request accepted for page " + (page.index + 1) + ".");
+					pluginMethod("GoToPage", [page.index, [left, top]]).catch(function () {});
+				}
+				return result;
 			})
 			.catch(function (error) {
+				clearTimeout(pending);
 				setStatus("Could not highlight line: " + (error && error.message ? error.message : String(error)));
 			});
 	}
@@ -1229,9 +1241,6 @@
 		// Editing is disabled on purpose: the text is display-only.
 		text.setAttribute("aria-readonly", "true");
 		text.title = "Click to highlight the detected line in the editor";
-		text.addEventListener("click", function () {
-			goToLine(page, line);
-		});
 
 		var meta = document.createElement("div");
 		meta.className = "line-meta";
@@ -1261,6 +1270,10 @@
 		meta.appendChild(reject);
 		row.appendChild(text);
 		row.appendChild(meta);
+		row.addEventListener("click", function (event) {
+			if (event.target.closest(".conf, .copy, .reject, .line-crop")) return;
+			goToLine(page, line);
+		});
 		return row;
 	}
 
