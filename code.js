@@ -226,13 +226,14 @@
 				var file = doc.Document.GetFile();
 				for (var i = 0; i < file.pages.length; i++) {
 					var page = file.pages[i];
-					var dpi = page.Dpi || 72;
+					// W/H are already PDF points: the editor rasterizes them as
+					// W * (25.4/72) * (96/25.4) pixels in GetPageImage.
 					info.sizes.push({
-						width: page.W * 72 / dpi,
-						height: page.H * 72 / dpi,
+						width: page.W,
+						height: page.H,
 						rawWidth: page.W,
 						rawHeight: page.H,
-						dpi: dpi
+						dpi: page.Dpi || 72
 					});
 				}
 			} catch (error) {
@@ -799,6 +800,7 @@
 
 	function runOcr(scope) {
 		if (state.running) return;
+		pluginMethod("SetOcrLineHighlight", [null, null]).catch(function () {});
 		state.running = true;
 		state.cancelRequested = false;
 		updateButtons();
@@ -1108,17 +1110,25 @@
 	}
 
 	/**
-	 * Ask the editor to scroll to the recognized line. Coordinates are converted
-	 * from the OCR raster space to PDF points. A two-element rect scrolls with the
-	 * current zoom; a four-element rect would zoom to fit the line.
+	 * Scroll to the line and highlight its detector bbox, without creating a PDF
+	 * annotation. The raster bbox is scaled into PDF points, the same space that
+	 * GoToPage and the exported text layer use. The two-element GoToPage rect
+	 * keeps the current zoom.
 	 */
 	function goToLine(page, line) {
 		if (!line.quad || !page.pdfWidth || !page.pdfHeight || !page.width || !page.height) return;
 		var bounds = quadBounds(line.quad);
 		var left = bounds.left / page.width * page.pdfWidth;
-		// GoToPage measures `top` downwards from the top of the page.
 		var top = bounds.top / page.height * page.pdfHeight;
-		pluginMethod("GoToPage", [page.index, [left, top]]).catch(function () {});
+		var right = bounds.right / page.width * page.pdfWidth;
+		var bottom = bounds.bottom / page.height * page.pdfHeight;
+		return pluginMethod("GoToPage", [page.index, [left, top]])
+			.then(function () {
+				return pluginMethod("SetOcrLineHighlight", [page.index, [left, top, right, bottom]]);
+			})
+			.catch(function (error) {
+				setStatus("Could not highlight line: " + (error && error.message ? error.message : String(error)));
+			});
 	}
 
 	function toggleLineCrop(page, line, row) {
@@ -1218,7 +1228,7 @@
 		text.textContent = line.rawText || "";
 		// Editing is disabled on purpose: the text is display-only.
 		text.setAttribute("aria-readonly", "true");
-		text.title = "Click to jump to this line in the editor";
+		text.title = "Click to highlight the detected line in the editor";
 		text.addEventListener("click", function () {
 			goToLine(page, line);
 		});
@@ -1262,6 +1272,7 @@
 	}
 
 	function clearAll() {
+		pluginMethod("SetOcrLineHighlight", [null, null]).catch(function () {});
 		state.pages = [];
 		renderPages();
 		setStatus("Ready");
@@ -1835,7 +1846,10 @@
 	};
 
 	window.Asc.plugin.button = function () {
-		this.executeCommand("close", "");
+		var plugin = this;
+		pluginMethod("SetOcrLineHighlight", [null, null]).catch(function () {}).then(function () {
+			plugin.executeCommand("close", "");
+		});
 	};
 
 	window.Asc.plugin.onThemeChanged = function (theme) {
