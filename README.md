@@ -11,9 +11,12 @@ OCR runs entirely on the user's machine. No document content is uploaded anywher
 
 - **Run OCR** on every page of the open PDF.
 - **Per-line review** in the left panel: each recognized line is listed with its
-  confidence. Click a line to navigate to and temporarily highlight its OCR
-  detection box in the PDF editor. Reject the lines that are wrong; rejected text
-  is excluded from the exported text layer.
+  confidence. Click a line to highlight its OCR detection box in the PDF editor.
+  The view centers the region: the page itself when the page fits the window, and
+  the detected line when the page is taller than the window, so the line is never
+  left at the top edge. The highlight stays until you press `Esc`, click the page,
+  or pick another line. Reject the lines that are wrong; rejected text is excluded
+  from the exported text layer.
 - **Editing disabled**: this version only supports accept/reject, not manual text
   editing.
 - **Save as PLU PDF**: adds an invisible `Type0`/`CIDFontType2` Unicode text layer

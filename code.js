@@ -1110,10 +1110,11 @@
 	}
 
 	/**
-	 * Scroll to the line and highlight its detector bbox, without creating a PDF
-	 * annotation. The raster bbox is scaled into PDF points, the same space that
-	 * GoToPage and the exported text layer use. The two-element GoToPage rect
-	 * keeps the current zoom.
+	 * Highlight the detector bbox of a recognized line, without creating a PDF
+	 * annotation. The raster bbox is scaled into PDF points, the same space the
+	 * exported text layer uses. The editor centers the view on the box: the page
+	 * when it fits the viewport, otherwise the box itself, so the line is never
+	 * left at the top edge.
 	 */
 	function goToLine(page, line) {
 		if (!line.quad || !page.pdfWidth || !page.pdfHeight || !page.width || !page.height) return;
@@ -1126,14 +1127,13 @@
 		var pending = setTimeout(function () {
 			setStatus("Highlight API did not respond; check the editor console.");
 		}, 4000);
-		return pluginMethod("SetTextHighlight", [page.index, [left, top, right, bottom]])
+		return pluginMethod("SetTextHighlight", [page.index, [left, top, right, bottom], {center: true}])
 			.then(function (result) {
 				clearTimeout(pending);
 				if (result !== true) {
 					setStatus("Text highlight API result: " + String(result) + ".");
 				} else {
-					setStatus("Highlight request accepted for page " + (page.index + 1) + ".");
-					pluginMethod("GoToPage", [page.index, [left, top]]).catch(function () {});
+					setStatus("Highlighted line on page " + (page.index + 1) + ".");
 				}
 				return result;
 			})
