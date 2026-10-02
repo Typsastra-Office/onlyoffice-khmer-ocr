@@ -93,6 +93,13 @@ body {
     font-size: 13px;
 }
 
+.brand-build {
+    color: var(--text-soft);
+    font-size: 11px;
+    font-family: monospace;
+    opacity: .7;
+}
+
 .engine {
     display: flex;
     align-items: center;

@@ -15,6 +15,7 @@
                 <div class="brand">
                     <span class="brand-name">Khmer OCR</span>
                     <span class="brand-sub">local recognition &amp; PLU export</span>
+                    <span class="brand-build" id="build-stamp" title="Loaded plugin build"></span>
                 </div>
                 <div class="engine" id="engine" title="OCR engine status">
                     <span class="dot" id="engine-dot"></span>
@@ -40,6 +41,16 @@
                         <option value="6">6</option>
                         <option value="7">7</option>
                         <option value="8">8</option>
+                    </select>
+                </label>
+                <label class="opt" for="opt-width-font" title="Use an installed Khmer font to shape OCR cluster widths; OCR timing remains the fallback.">
+                    <span>Text widths</span>
+                    <select id="opt-width-font">
+                        <option value="ctc">OCR timing</option>
+                        <option value="Khmer OS System">Khmer OS System</option>
+                        <option value="Khmer OS Muol">Khmer OS Muol</option>
+                        <option value="Khmer OS Muol Light">Khmer OS Muol Light</option>
+                        <option value="Khmer OS Muol Pali">Khmer OS Muol Pali</option>
                     </select>
                 </label>
                 <div class="segmented" id="opt-view" role="group" aria-label="Result view">
@@ -77,6 +88,6 @@
         </footer>
     </div>
 
-    <script type="text/javascript" src="code.js?v=ocr-highlight-4"></script>
+    <script type="text/javascript" src="code.js?v=plu-gid-reuse-11"></script>
 </body>
 </html>

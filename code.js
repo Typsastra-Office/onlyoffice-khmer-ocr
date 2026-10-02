@@ -15,9 +15,31 @@
 
 	var WORKER_URL = "worker/ocr-worker.js";
 	var WORKER_VERSION = "plugin-1";
+	// Bump whenever code.js changes, and keep it in step with the ?v= query in
+	// index.html/config.json. A stale WebView cache silently keeps the old build,
+	// so the running build is shown in the panel header.
+	var PLUGIN_BUILD = "plu-gid-reuse-11";
 
 	var RASTER_MAX_SIDE = 1800;
 	var REVIEW_CONFIDENCE = 0.82;
+
+	// Khmer subscript coengs (្, ុ, ា and the subjoined consonants they pull down)
+	// hang well below the baseline, and the upper vowel marks (ិ ី ឹ and the
+	// prepended vowels) reach well above it, so a box built with Descent 0 stops
+	// at the baseline and cuts through the glyphs. Measured against the real ink
+	// on a sample page, the worst line needs roughly 81% of its box height above
+	// the baseline and 32% below. One split has to serve Khmer and Latin alike, so
+	// this leans toward the ascent: the tall upper marks are the part that was
+	// still clipping, while the descent only needs enough to clear the coengs.
+	// Must sum to 1000, since the font box is 1 em and the size that sets the box
+	// height is derived from it.
+	var LOGICAL_ASCENT = 740;
+	var LOGICAL_DESCENT = 260;
+	// The detection quad is the recognizer's line box, which understates the ink.
+	// Growth is capped by the line pitch rather than by the ink: on a dense page
+	// the neighbouring boxes are only about 8pt apart, so a much larger factor
+	// would make one line's selection run into the next one's.
+	var LOGICAL_BOX_GROWTH = 1.38;
 
 	var PDF_RECONSTRUCTION_TOOL = "Typsastra Khmer Document Reconstruction";
 	var PDF_RECONSTRUCTION_URL = "https://ocr.typsastra.com/";
@@ -38,6 +60,8 @@
 		pages: [],
 		status: "Ready",
 		previewMode: "lines",
+		widthFont: "ctc",
+		widthStats: null,
 		threads: 4,
 		effectiveThreads: 0,
 		pdfjs: null,
@@ -1354,6 +1378,7 @@
 
 	function buildLogicalUnits() {
 		var units = [];
+		state.widthStats = { shaped: 0, fallback: 0 };
 		var lineId = 0;
 		var chunkId = 0;
 		state.pages.forEach(function (page, pageIndex) {
@@ -1365,6 +1390,13 @@
 					return { unicode: chunk.unicode, start: chunk.start, end: chunk.end, id: chunkId++ };
 				});
 				if (!chunks.length) return;
+				var shapedWidths = measureShapedWidths(chunks, state.widthFont);
+				if (shapedWidths) chunks.forEach(function (chunk, index) {
+					chunk.advance = shapedWidths[index];
+				});
+				if (state.widthFont !== "ctc" && /[\u1780-\u17ff]/.test(unicode)) {
+					state.widthStats[shapedWidths ? "shaped" : "fallback"]++;
+				}
 				units.push({
 					id: lineId++,
 					pageIndex: pageIndex,
@@ -1377,44 +1409,328 @@
 		return units;
 	}
 
-	function createPdfLogicalFont(pdf, units, fontBytes) {
+	/**
+	 * Build a CIDFontType2 program with one glyph per distinct cluster width.
+	 *
+	 * The visible page is a flattened raster and the text layer is drawn in
+	 * invisible mode, so nothing here is ever painted. The glyphs exist only to
+	 * give each cluster a measurable box. That matters because PDFium, the engine
+	 * behind Chromium-based viewers, sizes a character's selection box from the
+	 * glyph outline and ignores the /W advance for its bounding box. CIDs with
+	 * equal widths can share a GID; its rectangle is that width. CIDs with
+	 * different widths must use different GIDs so their boxes remain accurate.
+	 *
+	 * Only the tables a CID-keyed PDF font needs are emitted: head, hhea, maxp,
+	 * hmtx, loca, glyf, plus name and post.
+	 * There is no cmap, because the font is addressed by CID through the PDF's
+	 * binary CIDToGIDMap and never by character code.
+	 */
+	function buildLogicalFontProgram(advances) {
+		var UPEM = 1000;
+		var glyphs = advances.map(function (advance) {
+			// The ink rectangle spans the full font box, descent below the baseline
+			// to ascent above it, so a reader that measures the glyph gets the whole
+			// cluster box and not just the part above the baseline.
+			return logicalRectGlyph(0, -LOGICAL_DESCENT, advance, LOGICAL_ASCENT);
+		});
+
+		// A short loca table wraps at 131070 bytes. A 64-page document can contain
+		// tens of thousands of clusters, so always use 32-bit glyph offsets.
+		var locaOffsets = [0];
+		for (var g = 0; g < glyphs.length; g++) {
+			locaOffsets.push(locaOffsets[g] + glyphs[g].length);
+		}
+		var locaBytes = new Uint8Array(locaOffsets.length * 4);
+		var locaView = new DataView(locaBytes.buffer);
+		for (var li = 0; li < locaOffsets.length; li++) {
+			locaView.setUint32(li * 4, locaOffsets[li], false);
+		}
+		var glyfBytes = concatBytes(glyphs);
+
+		var maxAdvance = advances.reduce(function (a, b) { return Math.max(a, b); }, 0);
+		var head = concatBytes([
+			uint32(0x00010000), uint32(0x00010000), uint32(0), uint32(0x5F0F3CF5),
+			uint16(0x000b), uint16(UPEM),
+			// created and modified are LONGDATETIME, 8 bytes each, left at zero so
+			// the program stays byte-for-byte reproducible across exports.
+			uint32(0), uint32(0), uint32(0), uint32(0),
+			int16(0), int16(-LOGICAL_DESCENT), int16(maxAdvance), int16(LOGICAL_ASCENT),
+			uint16(0), uint16(8), int16(2), int16(1), int16(0)
+		]);
+
+		var hheaParts = [
+			uint32(0x00010000),
+			int16(LOGICAL_ASCENT), int16(-LOGICAL_DESCENT), int16(0),
+			uint16(maxAdvance),
+			int16(0), int16(0), int16(maxAdvance),
+			int16(1), int16(0), int16(0),
+			int16(0), int16(0), int16(0), int16(0),
+			int16(0),
+			uint16(advances.length)
+		];
+		var hmtxParts = [];
+		for (var ai = 0; ai < advances.length; ai++) {
+			hmtxParts.push(uint16(advances[ai]), int16(0));
+		}
+
+		var maxp = concatBytes([
+			uint32(0x00010000), uint16(advances.length),
+			uint16(4), uint16(1), uint16(0), uint16(0), uint16(2),
+			uint16(0), uint16(0), uint16(0), uint16(0), uint16(0), uint16(0), uint16(0), uint16(0)
+		]);
+
+		// No OS/2 table: its layout changes between versions and it is not needed
+		// for a CID-keyed embedded font, where the box comes from glyf and the
+		// vertical metrics from the descriptor. Shipping a malformed one would be
+		// worse than shipping none.
+		var post = concatBytes([
+			uint32(0x00030000), uint32(0), int16(0), int16(0),
+			uint32(0), uint32(0), uint32(0), uint32(0), uint32(0)
+		]);
+
+		var nameRecords = [];
+		var nameStrings = [];
+		var nameOffset = 0;
+		[[1, "TypsastraLogical"], [2, "Regular"], [4, "TypsastraLogical"],
+			[6, "TypsastraLogical"]].forEach(function (pair) {
+			var text = stringToBytes(pair[1]);
+			// Mac Roman uses these ASCII-only names directly. Name records must
+			// precede the shared string storage; their offsets are relative to it.
+			nameRecords.push(concatBytes([
+				uint16(1), uint16(0), uint16(0), uint16(pair[0]),
+				uint16(text.length), uint16(nameOffset)
+			]));
+			nameStrings.push(text);
+			nameOffset += text.length;
+		});
+		var nameTable = concatBytes([uint16(0), uint16(nameRecords.length),
+			uint16(6 + 12 * nameRecords.length)].concat(nameRecords, nameStrings));
+
+		var tables = [
+			{ tag: "glyf", data: glyfBytes },
+			{ tag: "head", data: head },
+			{ tag: "hhea", data: concatBytes(hheaParts) },
+			{ tag: "hmtx", data: concatBytes(hmtxParts) },
+			{ tag: "loca", data: locaBytes },
+			{ tag: "maxp", data: maxp },
+			{ tag: "name", data: nameTable },
+			{ tag: "post", data: post }
+		];
+		tables.sort(function (a, b) { return a.tag < b.tag ? -1 : 1; });
+
+		var numTables = tables.length;
+		var searchRange = 16;
+		var entrySelector = 0;
+		while (searchRange * 2 <= numTables * 16) {
+			searchRange *= 2;
+			entrySelector++;
+		}
+		var rangeShift = numTables * 16 - searchRange;
+
+		var headerSize = 12 + numTables * 16;
+		var offset = headerSize;
+		var directory = [];
+		var body = [];
+		tables.forEach(function (table) {
+			var padded = padTo4(table.data);
+			directory.push(concatBytes([
+				stringToBytes(table.tag), uint32(tableChecksum(table.data)),
+				uint32(offset), uint32(table.data.length)
+			]));
+			body.push(padded);
+			offset += padded.length;
+		});
+
+		var font = concatBytes([
+			uint32(0x00010000), uint16(numTables), uint16(searchRange),
+			uint16(entrySelector), uint16(rangeShift)
+		].concat(directory).concat(body));
+
+		// head.checkSumAdjustment covers the whole font with its own field zeroed,
+		// which it already is at this point.
+		var headOffset = null;
+		var dirOffset = 12;
+		for (var t = 0; t < numTables; t++) {
+			if (stringFromBytes(font, dirOffset + t * 16, 4) === "head") {
+				headOffset = readUint32(font, dirOffset + t * 16 + 8);
+				break;
+			}
+		}
+		if (headOffset !== null) {
+			var adjustment = (0xB1B0AFBA - tableChecksum(font)) >>> 0;
+			writeUint32(font, headOffset + 8, adjustment);
+		}
+		return font;
+	}
+
+	/** One closed rectangular contour, the simplest glyph with a real bbox. */
+	function logicalRectGlyph(x0, y0, x1, y1) {
+		if (x1 <= x0) x1 = x0 + 1;
+		if (y1 <= y0) y1 = y0 + 1;
+		var points = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+		var parts = [
+			int16(1), int16(x0), int16(y0), int16(x1), int16(y1),
+			uint16(3),   // endPtsOfContours
+			uint16(0)    // instructionLength
+		];
+		// Every point on-curve, coordinates as full signed 16-bit deltas.
+		for (var p = 0; p < 4; p++) parts.push(uint8(0x01));
+		var prev = 0;
+		for (p = 0; p < 4; p++) {
+			parts.push(int16(points[p][0] - prev));
+			prev = points[p][0];
+		}
+		prev = 0;
+		for (p = 0; p < 4; p++) {
+			parts.push(int16(points[p][1] - prev));
+			prev = points[p][1];
+		}
+		return padTo4(concatBytes(parts));
+	}
+
+	function uint8(value) {
+		return new Uint8Array([value & 0xff]);
+	}
+
+	function uint16(value) {
+		return new Uint8Array([(value >> 8) & 0xff, value & 0xff]);
+	}
+
+	function int16(value) {
+		return uint16(value < 0 ? value + 0x10000 : value);
+	}
+
+	function uint32(value) {
+		return new Uint8Array([
+			(value >>> 24) & 0xff, (value >>> 16) & 0xff,
+			(value >>> 8) & 0xff, value & 0xff
+		]);
+	}
+
+	function readUint32(bytes, offset) {
+		return ((bytes[offset] << 24) | (bytes[offset + 1] << 16) |
+			(bytes[offset + 2] << 8) | bytes[offset + 3]) >>> 0;
+	}
+
+	function writeUint32(bytes, offset, value) {
+		bytes[offset] = (value >>> 24) & 0xff;
+		bytes[offset + 1] = (value >>> 16) & 0xff;
+		bytes[offset + 2] = (value >>> 8) & 0xff;
+		bytes[offset + 3] = value & 0xff;
+	}
+
+	function stringToBytes(text) {
+		var out = new Uint8Array(text.length);
+		for (var i = 0; i < text.length; i++) out[i] = text.charCodeAt(i) & 0xff;
+		return out;
+	}
+
+	function stringFromBytes(bytes, offset, length) {
+		var out = "";
+		for (var i = 0; i < length; i++) out += String.fromCharCode(bytes[offset + i]);
+		return out;
+	}
+
+	function concatBytes(parts) {
+		var total = 0;
+		parts.forEach(function (part) { total += part.length; });
+		var out = new Uint8Array(total);
+		var at = 0;
+		parts.forEach(function (part) {
+			out.set(part, at);
+			at += part.length;
+		});
+		return out;
+	}
+
+	function padTo4(bytes) {
+		var remainder = bytes.length % 4;
+		if (!remainder) return bytes;
+		var out = new Uint8Array(bytes.length + (4 - remainder));
+		out.set(bytes, 0);
+		return out;
+	}
+
+	function tableChecksum(bytes) {
+		var padded = padTo4(bytes);
+		var total = 0;
+		for (var i = 0; i < padded.length; i += 4) {
+			total = (total + (((padded[i] << 24) | (padded[i + 1] << 16) |
+				(padded[i + 2] << 8) | padded[i + 3]) >>> 0)) >>> 0;
+		}
+		return total;
+	}
+
+	function createPdfLogicalFont(pdf, units) {
 		var PDFLib = window.PDFLib;
 		var PDFHexString = PDFLib.PDFHexString;
 		var PDFString = PDFLib.PDFString;
-		var embeddedFontBytes = fontBytes instanceof Uint8Array ? fontBytes : new Uint8Array(fontBytes);
 		var chunks = units.flatMap(function (unit) { return unit.chunks; });
-		if (chunks.length > 0xffff) {
-			throw new Error("A document cannot contain more than 65,535 semantic text chunks.");
-		}
 
 		var cidById = new Map();
+		var cidsBySemanticWidth = new Map();
+		var gidByWidth = new Map();
+		var gidForCid = [0];
 		var mappings = [];
 		var widths = [];
-		var cidToGid = new Uint8Array((chunks.length + 1) * 2);
-		chunks.forEach(function (chunk, index) {
-			var cid = index + 1;
-			cidById.set(chunk.id, cid);
-			mappings.push([cidHex(cid), utf16BeHex(chunk.unicode)]);
-			widths.push(cid, [1000]);
-			// Semantic CIDs are independent from visual GIDs. The flattened page image
-			// supplies the visual representation, so every invisible chunk uses .notdef.
+		var glyphWidths = [1000]; // GID 0: .notdef
+		units.forEach(function (unit) {
+			var previousCid = 0;
+			unit.chunks.forEach(function (chunk) {
+				var advance = chunkAdvanceWidth(chunk);
+				var key = JSON.stringify([chunk.unicode, advance]);
+				var variants = cidsBySemanticWidth.get(key);
+				if (!variants) {
+					variants = [];
+					cidsBySemanticWidth.set(key, variants);
+				}
+				// PDFium may collapse adjacent copies of the same CID into one
+				// extracted character. Alternate CIDs for adjacent identical
+				// clusters, while mapping both to the same width-class GID.
+				var cid = variants[0];
+				if (cid === previousCid) cid = variants[1];
+				if (cid === undefined) {
+					cid = mappings.length + 1;
+					if (cid > 0xffff) throw new Error("Too many distinct logical clusters on one page.");
+					variants.push(cid);
+					mappings.push([cidHex(cid), utf16BeHex(chunk.unicode)]);
+					widths.push(cid, [advance]);
+					var gid = gidByWidth.get(advance);
+					if (gid === undefined) {
+						gid = glyphWidths.length;
+						gidByWidth.set(advance, gid);
+						glyphWidths.push(advance);
+					}
+					gidForCid[cid] = gid;
+				}
+				cidById.set(chunk.id, cid);
+				previousCid = cid;
+			});
 		});
 
+		// CID encodes Unicode and its selected width; GID encodes geometry only.
+		// The binary map is two big-endian bytes per CID, including CID zero.
+		var gidBytes = new Uint8Array(gidForCid.length * 2);
+		var gidView = new DataView(gidBytes.buffer);
+		gidForCid.forEach(function (gid, cid) {
+			gidView.setUint16(cid * 2, gid, false);
+		});
 		var cmap = buildToUnicodeCmap(mappings);
 		var cmapRef = pdf.context.register(pdf.context.flateStream(cmap));
-		var cidToGidRef = pdf.context.register(pdf.context.flateStream(cidToGid));
-		var fontFileRef = pdf.context.register(pdf.context.flateStream(embeddedFontBytes, {
-			Length1: embeddedFontBytes.length
+		var gidMapRef = pdf.context.register(pdf.context.flateStream(gidBytes));
+		var fontBytes = buildLogicalFontProgram(glyphWidths);
+		var fontFileRef = pdf.context.register(pdf.context.flateStream(fontBytes, {
+			Length1: fontBytes.length
 		}));
 		var descriptorRef = pdf.context.register(pdf.context.obj({
 			Type: "FontDescriptor",
 			FontName: "TypsastraLogical",
 			Flags: 4,
-			FontBBox: [0, 0, 1000, 1000],
+			FontBBox: [0, -LOGICAL_DESCENT, 1000, LOGICAL_ASCENT],
 			ItalicAngle: 0,
-			Ascent: 1000,
-			Descent: 0,
-			CapHeight: 1000,
+			Ascent: LOGICAL_ASCENT,
+			Descent: -LOGICAL_DESCENT,
+			CapHeight: LOGICAL_ASCENT,
 			StemV: 80,
 			FontFile2: fontFileRef
 		}));
@@ -1430,7 +1746,7 @@
 			FontDescriptor: descriptorRef,
 			DW: 1000,
 			W: widths,
-			CIDToGIDMap: cidToGidRef
+			CIDToGIDMap: gidMapRef
 		}));
 		var ref = pdf.context.register(pdf.context.obj({
 			Type: "Font",
@@ -1443,6 +1759,8 @@
 
 		return {
 			ref: ref,
+			cidCount: mappings.length,
+			glyphCount: glyphWidths.length,
 			cidFor: function (chunk) { return PDFHexString.of(cidHex(cidById.get(chunk.id))); },
 			cidsFor: function (chunks) {
 				return PDFHexString.of(chunks.map(function (chunk) {
@@ -1450,6 +1768,77 @@
 				}).join(""));
 			}
 		};
+	}
+
+	/**
+	 * A cluster's advance width in 1000-unit em space, from its normalized CTC
+	 * interval. Both ends are clamped so a degenerate or missing interval still
+	 * yields a usable non-zero width.
+	 */
+	function chunkAdvanceWidth(chunk) {
+		if (Number.isInteger(chunk.advance) && chunk.advance > 0) return chunk.advance;
+		var start = Number(chunk.start);
+		var end = Number(chunk.end);
+		if (!Number.isFinite(start) || !Number.isFinite(end)) return 1000;
+		var span = end - start;
+		if (!(span > 0)) return 1;
+		return Math.max(1, Math.round(span * 1000));
+	}
+
+	/**
+	 * Shape the complete OCR line so Khmer substitutions and mark placement have
+	 * their normal context. Prefix advances locate grapheme boundaries; measuring
+	 * isolated glyphs would give the wrong width for subscript consonants. The
+	 * synthetic PDF font remains one CID per cluster regardless of this choice.
+	 * Font choice is explicit: source PDF subset names often conceal the face.
+	 */
+	function measureShapedWidths(chunks, family) {
+		if (!family || family === "ctc" || !chunks.length ||
+			!chunks.some(function (chunk) { return /[\u1780-\u17ff]/.test(chunk.unicode); }) ||
+			chunks.some(function (chunk) { return /[A-Za-z]/.test(chunk.unicode); }) ||
+			typeof document === "undefined") return null;
+		var canvas = document.createElement("canvas");
+		var context = canvas.getContext("2d");
+		if (!context) return null;
+		var size = 64;
+		context.font = size + 'px "' + family + '"';
+		// An unavailable local font silently renders in a fallback face. Compare
+		// a Khmer probe against an intentionally nonexistent family before using it.
+		var probe = "សទ្ទានុក្រមពាក្យច្បាប់";
+		var availableWidth = context.measureText(probe).width;
+		context.font = size + 'px "TypsastraMissingWidthFace"';
+		var fallbackWidth = context.measureText(probe).width;
+		if (!Number.isFinite(availableWidth) || availableWidth <= 0 ||
+			Math.abs(availableWidth - fallbackWidth) < 0.1) return null;
+		context.font = size + 'px "' + family + '"';
+		var prefix = "";
+		var positions = [0];
+		chunks.forEach(function (chunk) {
+			prefix += chunk.unicode;
+			positions.push(context.measureText(prefix).width);
+		});
+		var total = positions[positions.length - 1];
+		if (!Number.isFinite(total) || total <= 0) return null;
+		var result = [];
+		for (var i = 1; i < positions.length; i++) {
+			var delta = positions[i] - positions[i - 1];
+			// Contextual shaping can move a prefix boundary backwards. Such a
+			// cluster has no safe per-CID advance; keep OCR timing for this line.
+			if (!Number.isFinite(delta) || delta <= 0) return null;
+			result.push(Math.max(1, Math.round(delta * 1000 / total)));
+		}
+		return result;
+	}
+
+	/**
+	 * Sum of a line's cluster advance widths, in 1000-unit em space. The drawn run
+	 * spans this many ems at font size 1, so the caller scales by 1000 / total to
+	 * make the run cover exactly one text-space unit.
+	 */
+	function advanceTotalFor(chunks) {
+		return chunks.reduce(function (total, chunk) {
+			return total + chunkAdvanceWidth(chunk);
+		}, 0);
 	}
 
 	function buildToUnicodeCmap(mappings) {
@@ -1488,8 +1877,23 @@
 	 * quad. Drawing the whole line in one text-showing operation (instead of one
 	 * operation per chunk) is what stops PDF viewers from inserting spaces
 	 * between chunks when the text is copied.
+	 *
+	 * The vertical text matrix vector must be unit length. A reader derives a
+	 * glyph box of size * |vertical|, so passing the raw quad height there would
+	 * scale the box by the height a second time and the selection would ignore
+	 * both the detection box and the glyphs.
+	 *
+	 * The font box is 1 em tall (Ascent 740, Descent -260), so with a unit vertical
+	 * vector the box height is exactly the font size: it carries the detection
+	 * quad's height, grown by LOGICAL_BOX_GROWTH to reach the descenders. Width is
+	 * scaled independently, because one font size cannot
+	 * satisfy both axes at once. advanceTotal is the sum of the cluster widths in
+	 * 1000-unit em space, taken from the CTC intervals, so each cluster advances
+	 * by the share of the line the recognizer actually used; a run advances
+	 * advanceTotal/1000 ems, and the horizontal vector is scaled by
+	 * (1000/advanceTotal) / quadHeight so the run spans exactly the quad width.
 	 */
-	function drawInvisibleLogicalLine(page, fontKey, encodedCids, sourceQuad, sourcePage, chunkCount) {
+	function drawInvisibleLogicalLine(page, fontKey, encodedCids, sourceQuad, sourcePage, advanceTotal) {
 		var PDFLib = window.PDFLib;
 		var quad = {};
 		Object.keys(sourceQuad).forEach(function (name) {
@@ -1497,16 +1901,32 @@
 		});
 		var horizontal = { x: quad.p2.x - quad.p3.x, y: quad.p2.y - quad.p3.y };
 		var vertical = { x: quad.p0.x - quad.p3.x, y: quad.p0.y - quad.p3.y };
-		// Every CID advances exactly 1 em, so a font size of 1/chunkCount makes
-		// the run span exactly one text-space unit, i.e. the full line width.
-		var size = chunkCount > 0 ? 1 / chunkCount : 1;
+
+		var verticalLength = Math.sqrt(vertical.x * vertical.x + vertical.y * vertical.y);
+		if (verticalLength > 0) {
+			vertical = { x: vertical.x / verticalLength, y: vertical.y / verticalLength };
+		}
+
+		// |vertical| is now 1, so the glyph box height equals the font size times
+		// the font's ascent+descent, which is 1 em (Ascent 740, Descent -260). The
+		// horizontal side is independent: a run advances advanceTotal/1000 ems, so
+		// the size that makes it span the full line width is 1000 / advanceTotal.
+		// Height and width are therefore scaled by the text matrix, not by the font
+		// size, or one of them would be wrong: the font size can only satisfy one.
+		var total = Number(advanceTotal);
+		var widthSize = total > 0 ? 1000 / total : 1;
+		// The font size sets the box height, so carry the (grown) detection quad
+		// height here and let the horizontal vector be scaled by the ratio instead.
+		var heightSize = verticalLength > 0 ? verticalLength * LOGICAL_BOX_GROWTH : 1;
+		var widthScale = widthSize / heightSize;
 
 		page.pushOperators(
 			PDFLib.pushGraphicsState(),
 			PDFLib.beginText(),
 			PDFLib.setTextRenderingMode(PDFLib.TextRenderingMode.Invisible),
-			PDFLib.setFontAndSize(fontKey, size),
-			PDFLib.setTextMatrix(horizontal.x, horizontal.y, vertical.x, vertical.y, quad.p3.x, quad.p3.y),
+			PDFLib.setFontAndSize(fontKey, heightSize),
+			PDFLib.setTextMatrix(horizontal.x * widthScale, horizontal.y * widthScale,
+				vertical.x, vertical.y, quad.p3.x, quad.p3.y),
 			PDFLib.showText(encodedCids),
 			PDFLib.endText(),
 			PDFLib.popGraphicsState()
@@ -1692,26 +2112,25 @@
 		if (!units.length) {
 			throw new Error("Nothing to export: every recognized line was rejected.");
 		}
-		return fetchAsset("assets/TypsastraLogical.ttf").then(function (fontBytes) {
-			var logicalFont = createPdfLogicalFont(pdf, units, fontBytes);
-			var fontKeys = new Map();
+		// Give each page its own font. CID/GID indices start at one per page; this
+		// also bounds the font size for long documents without splitting a line.
+		return Promise.resolve().then(function () {
+			var byPage = new Map();
 			units.forEach(function (unit) {
-				var sourcePage = state.pages[unit.pageIndex];
-				var page = pdf.getPage(unit.pageIndex);
+				if (!byPage.has(unit.pageIndex)) byPage.set(unit.pageIndex, []);
+				byPage.get(unit.pageIndex).push(unit);
+			});
+			byPage.forEach(function (pageUnits, pageIndex) {
+				var page = pdf.getPage(pageIndex);
 				if (!page) return;
-				var fontKey = fontKeys.get(unit.pageIndex);
-				if (!fontKey) {
-					fontKey = page.node.newFontDictionary("TypsastraLogical", logicalFont.ref);
-					fontKeys.set(unit.pageIndex, fontKey);
-				}
-				drawInvisibleLogicalLine(
-					page,
-					fontKey,
-					logicalFont.cidsFor(unit.chunks),
-					unit.quad,
-					sourcePage,
-					unit.chunks.length
-				);
+				var logicalFont = createPdfLogicalFont(pdf, pageUnits);
+				var fontKey = page.node.newFontDictionary("TypsastraLogical", logicalFont.ref);
+				pageUnits.forEach(function (unit) {
+					drawInvisibleLogicalLine(
+						page, fontKey, logicalFont.cidsFor(unit.chunks), unit.quad,
+						state.pages[pageIndex], advanceTotalFor(unit.chunks)
+					);
+				});
 			});
 			setMetadata(pdf);
 			return pdf;
@@ -1764,7 +2183,11 @@
 				saveBlob(bytes, documentName() + "-PLU.pdf");
 				setProgress(1, "PLU PDF ready");
 				setStatus("PLU PDF created: " + state.logicalUnitCount + " line(s)" +
-					(usedOriginal ? ", original page quality kept." : "."));
+					(usedOriginal ? ", original page quality kept" : "") +
+					(state.widthFont !== "ctc" && state.widthStats ?
+						", font widths on " + state.widthStats.shaped + " Khmer line(s)" +
+						(state.widthStats.fallback ? ", OCR timing on " +
+							state.widthStats.fallback + " line(s)" : "") : "") + ".");
 				window.setTimeout(function () { setProgress(null); }, 2500);
 			})
 			.catch(function (error) {
@@ -1818,6 +2241,13 @@
 		if (byId("btn-reject-all")) byId("btn-reject-all").addEventListener("click", function () { setAllLines("rejected"); });
 
 		var threadsSelect = byId("opt-threads");
+		var widthSelect = byId("opt-width-font");
+		if (widthSelect) {
+			widthSelect.value = state.widthFont;
+			widthSelect.addEventListener("change", function () {
+				state.widthFont = this.value;
+			});
+		}
 		if (threadsSelect) {
 			threadsSelect.value = String(state.threads);
 			threadsSelect.addEventListener("change", function () {
@@ -1848,6 +2278,9 @@
 	window.Asc.plugin.init = function () {
 		bindUi();
 		applyTheme(window.Asc.plugin.theme);
+		// Surface the running build so a stale cached copy is obvious at a glance.
+		var stamp = byId("build-stamp");
+		if (stamp) stamp.textContent = "build " + PLUGIN_BUILD;
 		setStatus("Ready");
 		setEngine("", "starting engine…");
 		updateButtons();
