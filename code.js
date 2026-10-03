@@ -14,11 +14,11 @@
 	"use strict";
 
 	var WORKER_URL = "worker/ocr-worker.js";
-	var WORKER_VERSION = "plugin-1";
+	var WORKER_VERSION = "pdf-selection-recognition-12";
 	// Bump whenever code.js changes, and keep it in step with the ?v= query in
 	// index.html/config.json. A stale WebView cache silently keeps the old build,
 	// so the running build is shown in the panel header.
-	var PLUGIN_BUILD = "plu-gid-reuse-11";
+	var PLUGIN_BUILD = "pdf-selection-recognition-12";
 
 	var RASTER_MAX_SIDE = 1800;
 	var REVIEW_CONFIDENCE = 0.82;
@@ -274,6 +274,46 @@
 			}
 			return info;
 		});
+	}
+
+	/**
+	 * Read the same per-line quads that the PDF editor uses for selection. The
+	 * copied text may be corrupt (legacy Khmer font encodings), but its geometry
+	 * still locates the visible ink. Asc.scope carries the page index into the
+	 * editor's separate Document Builder execution context.
+	 */
+	function readSelectionGeometry(pageIndex) {
+		var previousScope = window.Asc.scope;
+		window.Asc.scope = Object.assign({}, previousScope || {}, { pageIndex: pageIndex });
+		var request;
+		try {
+			request = callCommand(function () {
+				try {
+					var file = Api.GetDocument().Document.GetFile();
+					var index = Asc.scope.pageIndex;
+					if (!file || !file.pages || !file.pages[index] ||
+						typeof file.copyPageTextWithQuads !== "function") return null;
+					var page = file.pages[index];
+					if (!page.text && page.originIndex != null && typeof file.getText === "function") {
+						page.text = file.getText(page.originIndex);
+					}
+					return JSON.stringify({
+						width: page.W,
+						height: page.H,
+						rotation: page.Rotate || 0,
+						lines: file.copyPageTextWithQuads(index)
+					});
+				} catch (error) {
+					return null;
+				}
+			});
+		} finally {
+			window.Asc.scope = previousScope;
+		}
+		return request.then(function (result) {
+			if (typeof result !== "string") return null;
+			try { return JSON.parse(result); } catch (error) { return null; }
+		}).catch(function () { return null; });
 	}
 
 	function documentName() {
@@ -582,20 +622,88 @@
 		}
 	}
 
-	function ocrPage(pageIndex, image) {
+	function ocrPage(pageIndex, image, detections) {
 		var requestId = ++state.requestId;
 		return new Promise(function (resolve, reject) {
 			state.pageWaiters[requestId] = { resolve: resolve, reject: reject };
 			state.worker.postMessage({
-				type: "process-page",
+				type: detections.length ? "recognize-page" : "process-page",
 				requestId: requestId,
 				page: pageIndex,
 				pageId: pageIndex,
 				width: image.width,
 				height: image.height,
-				rgba: image.rgba
+				rgba: image.rgba,
+				detections: detections.length ? detections : undefined
 			});
 		});
+	}
+
+	/**
+	 * The editor's copyPageTextWithQuads coordinates are page units with a
+	 * top-left origin. Convert to the rendered page's pixels, and reorder its
+	 * TL, TR, BL, BR corners to the recognizer's TL, TR, BR, BL convention.
+	 * Broken extracted text is used only to identify nonempty selectable lines.
+	 */
+	function selectionDetections(selection, image) {
+		if (!selection || !Array.isArray(selection.lines) || !image ||
+			(selection.rotation && selection.rotation % 360 !== 0) ||
+			!Number.isFinite(selection.width) || !Number.isFinite(selection.height) ||
+			selection.width <= 0 || selection.height <= 0 || image.width <= 0 || image.height <= 0) return [];
+		var sourceAspect = selection.width / selection.height;
+		if (Math.abs(image.width / image.height / sourceAspect - 1) > 0.03) return [];
+		var scaleX = image.width / selection.width;
+		var scaleY = image.height / selection.height;
+		var detections = [];
+		selection.lines.forEach(function (line) {
+			if (!line || !line.text || !String(line.text).replace(/[\s\uFFFF]/g, "") ||
+				!Array.isArray(line.quads) || line.quads.length !== 8 ||
+				!line.quads.every(Number.isFinite)) return;
+			function point(index) {
+				return { x: line.quads[index * 2] * scaleX, y: line.quads[index * 2 + 1] * scaleY };
+			}
+			var quad = { p0: point(0), p1: point(1), p2: point(3), p3: point(2) };
+			var bounds = quadBounds(quad);
+			var width = Math.hypot(quad.p1.x - quad.p0.x, quad.p1.y - quad.p0.y);
+			var height = Math.hypot(quad.p3.x - quad.p0.x, quad.p3.y - quad.p0.y);
+			if (width < 2 || height < 2 || bounds.right <= 0 || bounds.bottom <= 0 ||
+				bounds.left >= image.width || bounds.top >= image.height) return;
+			detections.push({ id: detections.length, quad: quad, score: 1,
+				order: { region: 0, line: detections.length, position: 0 } });
+		});
+		return mergeSelectionFragments(detections);
+	}
+
+	// PDF font runs can split one visual line. Merge nearby horizontal runs
+	// while leaving separate columns and rotated text as individual crops.
+	function mergeSelectionFragments(detections) {
+		var result = [];
+		detections.forEach(function (detection) {
+			var previous = result[result.length - 1];
+			var a = previous && quadBounds(previous.quad);
+			var b = quadBounds(detection.quad);
+			var ha = a && a.bottom - a.top;
+			var hb = b.bottom - b.top;
+			var gap = a && b.left - a.right;
+			var sameLine = a && Math.abs(previous.quad.p1.y - previous.quad.p0.y) < ha * 0.08 &&
+				Math.abs(detection.quad.p1.y - detection.quad.p0.y) < hb * 0.08 &&
+				Math.max(ha, hb) / Math.min(ha, hb) < 1.35 &&
+				Math.abs((a.top + a.bottom) - (b.top + b.bottom)) < Math.min(ha, hb) * 0.4 &&
+				gap >= -Math.min(ha, hb) * 0.2 && gap <= Math.min(ha, hb) * 1.5;
+			if (sameLine) {
+				previous.quad = {
+					p0: { x: a.left, y: Math.min(a.top, b.top) },
+					p1: { x: b.right, y: Math.min(a.top, b.top) },
+					p2: { x: b.right, y: Math.max(a.bottom, b.bottom) },
+					p3: { x: a.left, y: Math.max(a.bottom, b.bottom) }
+				};
+			} else {
+				detection.id = result.length;
+				detection.order.line = result.length;
+				result.push(detection);
+			}
+		});
+		return result;
 	}
 
 	/* -------------------------------------------------------------- OCR driver */
@@ -920,10 +1028,24 @@
 		setStatus("Rendering page " + (pageIndex + 1) + "…");
 
 		var image = null;
+		var geometrySource = "PP-OCR detector";
 		return renderer.render(pageIndex)
 			.then(function (rendered) {
 				image = rendered;
-				return ocrPage(pageIndex, rendered);
+				return readSelectionGeometry(pageIndex);
+			})
+			.then(function (selection) {
+				var detections = selectionDetections(selection, image);
+				if (detections.length) geometrySource = "PDF selection";
+				return ocrPage(pageIndex, image, detections).then(function (message) {
+					if (!detections.length || (message.lines || []).some(function (line) {
+						return line.rawText && line.rawText.trim();
+					})) return message;
+					// An invisible or unrelated text layer can have selectable quads
+					// without visible ink. Retry with image detection in that case.
+					geometrySource = "PP-OCR detector";
+					return ocrPage(pageIndex, image, []);
+				});
 			})
 			.then(function (message) {
 				var lines = (message.lines || []).map(function (line) {
@@ -942,6 +1064,7 @@
 					pdfHeight: image.pdfHeight,
 					editorSize: image.editorSize,
 					renderKind: renderer.kind,
+					geometrySource: geometrySource,
 					sourceTextAnchors: image.sourceTextAnchors || [],
 					lines: lines,
 					error: null
@@ -949,7 +1072,7 @@
 				state.pages.sort(function (a, b) { return a.index - b.index; });
 				setPageProgress(1, "Page " + (pageIndex + 1) + ": " + lines.length + " lines");
 				setStatus("Page " + (pageIndex + 1) + ": raster " + widthPx + "×" + heightPx +
-					" · " + lines.length + " lines · " + renderer.kind);
+					" · " + lines.length + " lines · " + geometrySource);
 				renderPages();
 			});
 	}
@@ -1134,7 +1257,7 @@
 	}
 
 	/**
-	 * Highlight the detector bbox of a recognized line, without creating a PDF
+	 * Highlight the recognized line's selection or detector box, without creating a PDF
 	 * annotation. The raster bbox is scaled into PDF points, the same space the
 	 * exported text layer uses. The editor centers the view on the box: the page
 	 * when it fits the viewport, otherwise the box itself, so the line is never
@@ -1142,7 +1265,7 @@
 	 */
 	function goToLine(page, line) {
 		if (!line.quad || !page.pdfWidth || !page.pdfHeight || !page.width || !page.height) return;
-		setStatus("Showing detected line on page " + (page.index + 1) + "…");
+		setStatus("Showing line on page " + (page.index + 1) + "…");
 		var bounds = quadBounds(line.quad);
 		var left = bounds.left / page.width * page.pdfWidth;
 		var top = bounds.top / page.height * page.pdfHeight;
@@ -1222,6 +1345,7 @@
 		var metaParts = [page.lines.length + " line" + (page.lines.length === 1 ? "" : "s")];
 		if (page.width && page.height) metaParts.push("raster " + page.width + "×" + page.height);
 		if (page.renderKind) metaParts.push(page.renderKind);
+		if (page.geometrySource) metaParts.push(page.geometrySource);
 		meta.textContent = metaParts.join(" · ");
 
 		head.appendChild(caret);
@@ -1264,7 +1388,7 @@
 		text.textContent = line.rawText || "";
 		// Editing is disabled on purpose: the text is display-only.
 		text.setAttribute("aria-readonly", "true");
-		text.title = "Click to highlight the detected line in the editor";
+		text.title = "Click to highlight this line in the editor";
 
 		var meta = document.createElement("div");
 		meta.className = "line-meta";
@@ -1402,7 +1526,8 @@
 					pageIndex: pageIndex,
 					unicode: unicode,
 					chunks: chunks,
-					quad: pdfSemanticQuad(page, line.quad || line.alignmentQuad)
+					quad: page.geometrySource === "PDF selection"
+						? line.quad : pdfSemanticQuad(page, line.quad || line.alignmentQuad)
 				});
 			});
 		});
@@ -1884,8 +2009,8 @@
 	 * both the detection box and the glyphs.
 	 *
 	 * The font box is 1 em tall (Ascent 740, Descent -260), so with a unit vertical
-	 * vector the box height is exactly the font size: it carries the detection
-	 * quad's height, grown by LOGICAL_BOX_GROWTH to reach the descenders. Width is
+	 * vector the box height is exactly the font size: it carries the PDF selection
+	 * height unchanged or grows an OCR detector box to reach the descenders. Width is
 	 * scaled independently, because one font size cannot
 	 * satisfy both axes at once. advanceTotal is the sum of the cluster widths in
 	 * 1000-unit em space, taken from the CTC intervals, so each cluster advances
@@ -1915,9 +2040,10 @@
 		// size, or one of them would be wrong: the font size can only satisfy one.
 		var total = Number(advanceTotal);
 		var widthSize = total > 0 ? 1000 / total : 1;
-		// The font size sets the box height, so carry the (grown) detection quad
-		// height here and let the horizontal vector be scaled by the ratio instead.
-		var heightSize = verticalLength > 0 ? verticalLength * LOGICAL_BOX_GROWTH : 1;
+		// PDF selection geometry already has the correct height. Only detector
+		// boxes need growth to cover the ink above and below their crop.
+		var growth = sourcePage.geometrySource === "PDF selection" ? 1 : LOGICAL_BOX_GROWTH;
+		var heightSize = verticalLength > 0 ? verticalLength * growth : 1;
 		var widthScale = widthSize / heightSize;
 
 		page.pushOperators(
@@ -2311,6 +2437,9 @@
 		state: state,
 		run: runAllPages,
 		save: savePlu,
-		clear: clearAll
+		clear: clearAll,
+		selectionDetections: selectionDetections,
+		readSelectionGeometry: readSelectionGeometry,
+		ocrPage: ocrPage
 	};
 })(window, undefined);

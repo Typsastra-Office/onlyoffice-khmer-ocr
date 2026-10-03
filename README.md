@@ -9,9 +9,12 @@ OCR runs entirely on the user's machine. No document content is uploaded anywher
 
 ## Features
 
-- **Run OCR** on every page of the open PDF.
+- **Run OCR** on every page of the open PDF. On pages with selectable text, use
+  the PDF editor's line-selection geometry to crop the visible text for OCR even
+  when the embedded Khmer Unicode is broken. Pages without usable selection
+  geometry use the PP-OCRv6 detector.
 - **Per-line review** in the left panel: each recognized line is listed with its
-  confidence. Click a line to highlight its OCR detection box in the PDF editor.
+  confidence. Click a line to highlight its PDF selection or OCR detection box in the PDF editor.
   The view centers the region: the page itself when the page fits the window, and
   the detected line when the page is taller than the window, so the line is never
   left at the top edge. The highlight stays until you press `Esc`, click the page,
@@ -70,8 +73,11 @@ worker/
 resources/               plugin + store icons, store screenshots
 ```
 
-Pipeline: PDF page image → PP-OCRv6 tiny detector → DB post-processing →
-perspective crop → AOU-CTC int8 recognizer → review → PLU text layer.
+Pipeline: PDF page image + editor selection quads (where available), otherwise
+PP-OCRv6 tiny detector + DB post-processing → perspective crop → AOU-CTC int8
+recognizer → review → PLU text layer. The broken extracted text is never used
+for recognition; only its selection geometry is used. The detector model loads
+only when a page needs the detector fallback.
 
 Page count and page sizes are read with the public Document Builder API
 (`Asc.plugin.callCommand`); no patched editor build is required.

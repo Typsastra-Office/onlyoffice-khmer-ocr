@@ -175,6 +175,7 @@ var DEFAULT_CONFIG = Object.freeze({
 
 var config = copyConfig(DEFAULT_CONFIG);
 var detectorSession = null;
+var detectorManifest = null;
 var recognizerSession = null;
 var vocabulary = null;
 var initialized = false;
@@ -269,7 +270,8 @@ async function handleMessage(message, requestId, page, pageId) {
 }
 
 /**
- * Load the detector, recognizer and vocabulary.
+ * Load the recognizer and vocabulary. The detector is loaded on demand only
+ * for pages with no usable PDF selection geometry.
  * @param {Object<string, *>|undefined} overrides
  * @param {Object<string, *>|undefined} runtimeOverrides
  * @param {*} requestId
@@ -287,14 +289,12 @@ async function initialize(overrides, runtimeOverrides, requestId) {
   }
 
   var manifestUrl = resourceUrl("models/manifest.json");
-  var nextDetector = null;
   var nextRecognizer = null;
 
   try {
     postEvent("engine-progress", requestId, null, null, { stage: "manifest", message: "Loading model manifest…" });
     var modelManifest = await fetchModelManifest(manifestUrl);
     var vocabUrl = versionedModelUrl(modelManifest, "vocab.json");
-    var detectorUrl = versionedModelUrl(modelManifest, "detector_tiny.onnx");
     postEvent("engine-progress", requestId, null, null, { stage: "vocab", message: "Loading vocabulary…" });
     var nextVocabulary = await loadJson(vocabUrl);
     if (!Array.isArray(nextVocabulary) || nextVocabulary.length !== RECOGNIZER_CLASSES) {
@@ -312,30 +312,25 @@ async function initialize(overrides, runtimeOverrides, requestId) {
     };
     // Load the model bytes directly so no host-specific fetch behaviour is
     // needed for the ONNX Runtime file loader.
-    postEvent("engine-progress", requestId, null, null, { stage: "detector", message: "Downloading detector model…" });
-    var detectorBytes = await loadArrayBuffer(detectorUrl);
-    postEvent("engine-progress", requestId, null, null, { stage: "detector-init", message: "Starting OCR engine…" });
-    nextDetector = await ort.InferenceSession.create(detectorBytes, sessionOptions);
     postEvent("engine-progress", requestId, null, null, { stage: "recognizer", message: "Loading recognizer model…" });
     var recognizerUrl = versionedModelUrl(modelManifest, "recognizer-int8.onnx");
     var recognizerBytes = await loadArrayBuffer(recognizerUrl);
     nextRecognizer = await ort.InferenceSession.create(recognizerBytes, sessionOptions);
 
-    assertNames(nextDetector.inputNames, [DETECTOR_INPUT], "detector input");
-    assertNames(nextDetector.outputNames, [DETECTOR_OUTPUT], "detector output");
     assertNames(nextRecognizer.inputNames, [RECOGNIZER_IMAGE_INPUT, RECOGNIZER_WIDTH_INPUT], "recognizer input");
     assertNames(nextRecognizer.outputNames, [RECOGNIZER_LOGITS_OUTPUT, RECOGNIZER_LENGTHS_OUTPUT], "recognizer output");
 
     safeDispose(detectorSession);
     safeDispose(recognizerSession);
-    detectorSession = nextDetector;
+    detectorSession = null;
+    detectorManifest = modelManifest;
     recognizerSession = nextRecognizer;
     vocabulary = nextVocabulary;
     initialized = true;
   } catch (error) {
-    safeDispose(nextDetector);
     safeDispose(nextRecognizer);
     initialized = false;
+    detectorManifest = null;
     throw withStage(error, "initializing OCR models");
   }
 
@@ -358,6 +353,27 @@ async function initialize(overrides, runtimeOverrides, requestId) {
     },
     config: copyConfig(config)
   });
+}
+
+async function ensureDetector(requestId) {
+  if (detectorSession) return;
+  if (!detectorManifest) throw new Error("OCR model manifest is unavailable");
+  var candidate = null;
+  try {
+    postEvent("engine-progress", requestId, null, null,
+      { stage: "detector", message: "Loading text detector for scanned page…" });
+    var detectorUrl = versionedModelUrl(detectorManifest, "detector_tiny.onnx");
+    var bytes = await loadArrayBuffer(detectorUrl);
+    candidate = await ort.InferenceSession.create(bytes, {
+      executionProviders: ["wasm"], graphOptimizationLevel: "all"
+    });
+    assertNames(candidate.inputNames, [DETECTOR_INPUT], "detector input");
+    assertNames(candidate.outputNames, [DETECTOR_OUTPUT], "detector output");
+    detectorSession = candidate;
+  } catch (error) {
+    safeDispose(candidate);
+    throw withStage(error, "loading text detector for scanned page");
+  }
 }
 
 async function fetchModelManifest(url) {
@@ -398,7 +414,7 @@ function validatedRuntimeConfig(overrides) {
  * @param {*} pageId
  */
 async function processPage(message, requestId, page, pageId) {
-  if (!initialized || !detectorSession || !recognizerSession || !vocabulary) {
+  if (!initialized || !recognizerSession || !vocabulary) {
     throw new Error("OCR worker is not initialized; send {type:'init'} first");
   }
   if (page == null) {
@@ -420,6 +436,7 @@ async function processPage(message, requestId, page, pageId) {
 
   var rgba = new Uint8ClampedArray(message.rgba);
   try {
+    await ensureDetector(requestId);
     postEvent("page-state", requestId, page, pageId, { state: "detecting" });
     postEvent("detection-progress", requestId, page, pageId, { completed: 0, total: 1, progress: 0 });
     var detections = await detectPage(rgba, width, height);
