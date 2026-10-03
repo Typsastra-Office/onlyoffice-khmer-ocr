@@ -18,7 +18,8 @@
 	// Bump whenever code.js changes, and keep it in step with the ?v= query in
 	// index.html/config.json. A stale WebView cache silently keeps the old build,
 	// so the running build is shown in the panel header.
-	var PLUGIN_BUILD = "pdf-parallel-workers-18";
+	var PLUGIN_BUILD = "pdf-selection-copy-23";
+	var COPY_SELECTION_MENU_ID = "khmer-ocr-copy-selection";
 	var PARALLELISM_KEY = "typsastra.khmer-ocr.parallel-workers";
 
 	function readWorkerPreference() {
@@ -337,6 +338,38 @@
 			if (typeof result !== "string") return null;
 			try { return JSON.parse(result); } catch (error) { return null; }
 		}).catch(function () { return null; });
+	}
+
+	/** Snapshot a text selection before the context menu click can change it. */
+	function readSelectedQuads() {
+		return callCommand(function () {
+			try {
+				var file = Api.GetDocument().Document.GetFile();
+				if (!file || !file.Selection || !file.Selection.IsSelection ||
+					typeof file.getSelectionQuads !== "function") return null;
+				var selected = file.getSelectionQuads();
+				var pages = selected.map(function (entry) {
+					var page = file.pages[entry.page];
+					return page && { index: entry.page, width: page.W, height: page.H,
+						rotation: page.Rotate || 0, quads: entry.quads };
+				}).filter(Boolean);
+				return JSON.stringify(pages);
+			} catch (error) { return null; }
+		}).then(function (result) {
+			try { return typeof result === "string" ? JSON.parse(result) : []; }
+			catch (error) { return []; }
+		});
+	}
+
+	function selectedDetections(selection, image) {
+		if (!selection || !Array.isArray(selection.quads)) return [];
+		return selectionDetections({ width: selection.width, height: selection.height,
+			rotation: selection.rotation, lines: selection.quads.map(function (quad) {
+				return { text: "ក", quads: quad };
+			}) }, image).sort(function (a, b) {
+			return quadBounds(a.quad).top - quadBounds(b.quad).top ||
+				quadBounds(a.quad).left - quadBounds(b.quad).left;
+		});
 	}
 
 	function documentName() {
@@ -1165,6 +1198,105 @@
 
 	function runAllPages() { runOcr("all"); }
 	function runCurrentPage() { runOcr("current"); }
+
+	function copyRecognizedSelection(text) {
+		if (!text) throw new Error("No text recognized in the selection");
+		// OCR completes long after the menu click; a plugin iframe no longer has a
+		// clipboard user gesture. Ask the main editor frame (which has desktop
+		// clipboard access) to perform the copy, then try the iframe as fallback.
+		return pluginMethod("CopyKhmerOcrText", [text]).then(function (copied) {
+			if (copied === true) return;
+			return copyInPluginFrame(text);
+		}).catch(function () { return copyInPluginFrame(text); });
+	}
+
+	function copyInPluginFrame(text) {
+		if (navigator.clipboard && navigator.clipboard.writeText) {
+			return navigator.clipboard.writeText(text).catch(function () {
+				return copySelectedTextFallback(text);
+			});
+		}
+		return copySelectedTextFallback(text);
+	}
+
+	function copySelectedTextFallback(text) {
+		var area = document.createElement("textarea");
+		area.value = text;
+		area.setAttribute("readonly", "true");
+		area.style.position = "fixed";
+		area.style.top = "-1000px";
+		document.body.appendChild(area);
+		try {
+			area.select();
+			if (!document.execCommand("copy")) throw new Error("Clipboard access was denied");
+		} finally {
+			area.remove();
+		}
+	}
+
+	/** Recognize only the selected PDF regions; never trigger full-page detection. */
+	function copySelectionWithOcr(pages) {
+		if (state.running) return Promise.resolve();
+		state.running = true;
+		updateButtons();
+		setStatus("Recognizing selected text…");
+		var renderer;
+		return ensureWorker().then(function () { return readDocumentInfo(); }).then(function (info) {
+			return createPdfJsRenderer(info.sizes).then(function (pdfRenderer) {
+				renderer = pdfRenderer || { render: function (index) {
+					return renderEditorPage(index, info.sizes);
+				}, destroy: function () {} };
+				var ordered = pages.slice().sort(function (a, b) { return a.index - b.index; });
+				var results = [];
+				var chain = Promise.resolve();
+				ordered.forEach(function (page, position) {
+					chain = chain.then(function () {
+						state.runBase = position / ordered.length;
+						state.runSpan = 1 / ordered.length;
+						return renderer.render(page.index).then(function (image) {
+							var regions = selectedDetections(page, image);
+							if (!regions.length) throw new Error("Selected text has no usable PDF geometry");
+							return ocrPage(page.index, image, regions).then(function (message) {
+								var text = (message.lines || []).map(function (line) {
+									return line.rawText || "";
+								}).filter(Boolean).join("\n");
+								if (text) results.push(text);
+							});
+						});
+					});
+				});
+				return chain.then(function () { return copyRecognizedSelection(results.join("\n")); });
+			});
+		}).then(function () {
+			setStatus("Recognized selection copied.");
+		}).catch(function (error) {
+			console.error(error);
+			setStatus("Copy with Khmer OCR failed: " + (error && error.message || String(error)));
+		}).then(function () {
+			if (renderer) renderer.destroy();
+			state.running = false;
+			state.parallelProgress = null;
+			setProgress(null);
+			updateButtons();
+		});
+	}
+
+	function copyCurrentSelectionWithOcr() {
+		if (state.running) return Promise.resolve();
+		return readSelectedQuads().then(function (pages) {
+			var valid = pages && pages.filter(function (page) {
+				return page && page.rotation % 360 === 0 && Array.isArray(page.quads) &&
+					page.quads.some(function (quad) { return Array.isArray(quad) && quad.length === 8; });
+			});
+			if (!valid || !valid.length) {
+				setStatus("Select PDF text before using Copy with Khmer OCR.");
+				return;
+			}
+			return copySelectionWithOcr(valid);
+		}).catch(function (error) {
+			setStatus("Could not read PDF selection: " + (error && error.message || String(error)));
+		});
+	}
 
 	function stopOcr() {
 		if (!state.running) return;
@@ -2767,6 +2899,22 @@
 		applyTheme(theme);
 	};
 
+	// The plugin bridge dispatches subscribed events as event_<eventName>.
+	window.Asc.plugin.event_onContextMenuClick = function (item) {
+		var id = item && typeof item === "object" ? item.id : item;
+		if (id !== COPY_SELECTION_MENU_ID) return;
+		if (item && Array.isArray(item.pages) && item.pages.length) {
+			var pages = item.pages.filter(function (page) {
+				return page && page.rotation % 360 === 0 && Array.isArray(page.quads) &&
+					page.quads.some(function (quad) { return Array.isArray(quad) && quad.length === 8; });
+			});
+			if (pages.length) return copySelectionWithOcr(pages);
+			else setStatus("Selected PDF text has no usable OCR geometry.");
+		} else {
+			return copyCurrentSelectionWithOcr();
+		}
+	};
+
 	window.Asc.plugin.onTranslate = function () {
 		// The panel is intentionally English-only in this version.
 	};
@@ -2784,6 +2932,10 @@
 		resetWorker: resetWorker,
 		readWorkerPreference: readWorkerPreference,
 		saveWorkerPreference: saveWorkerPreference,
+		selectedDetections: selectedDetections,
+		readSelectedQuads: readSelectedQuads,
+		copyRecognizedSelection: copyRecognizedSelection,
+		copySelectionWithOcr: copySelectionWithOcr,
 		pdfTextAnchors: pdfTextAnchors,
 		sourceFontForLine: sourceFontForLine,
 		extractedLatinLine: extractedLatinLine

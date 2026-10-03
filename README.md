@@ -13,6 +13,12 @@ OCR runs entirely on the user's machine. No document content is uploaded anywher
   the PDF editor's line-selection geometry to crop the visible text for OCR even
   when the embedded Khmer Unicode is broken. Pages without usable selection
   geometry use the PP-OCRv6 detector.
+- **Copy with Khmer OCR**: select text in the PDF editor and choose the action
+  from its context menu while the plugin is open. Only the selected glyph
+  regions are recognized, then their Khmer text is copied to the clipboard in
+  page and line order. The editor snapshots the quads when its menu opens and
+  handles the clipboard write after OCR. Requires the Typsastra PDF editor menu
+  integration.
 - **Preserve readable Latin text**: when a selectable line contains valid Latin
   Unicode from a Latin PDF font, take its text directly instead of re-running
   OCR. Legacy Khmer fonts still use image recognition. Adjacent selection boxes

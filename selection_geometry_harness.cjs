@@ -37,6 +37,80 @@ function checkSavedWorkerPreference() {
 	console.log("Worker-count persistence and storage fallback passed");
 }
 
+async function checkSelectionCopyFlow() {
+	const source = fs.readFileSync(path.join(__dirname, "code.js"), "utf8");
+	const marker = "})(window, undefined);";
+	const probe = `
+		window.runSelectedCopyProbe = function(pages) {
+			var copies = [], rendered = [], regionsSeen = [], destroyed = false;
+			ensureWorker = function () { return Promise.resolve(); };
+			readDocumentInfo = function () { return Promise.resolve({ sizes: [] }); };
+			createPdfJsRenderer = function () { return Promise.resolve({
+				render: function (index) {
+					rendered.push(index);
+					return Promise.resolve({ width: 840, height: 1190 });
+				}, destroy: function () { destroyed = true; }
+			}); };
+			ocrPage = function (index, image, regions) {
+				regionsSeen.push({ page: index, regions: regions.length,
+					width: regions[0].quad.p1.x - regions[0].quad.p0.x });
+				return Promise.resolve({ lines: [{ rawText: 'Khmer page ' + index }] });
+			};
+			copyRecognizedSelection = function (text) {
+				copies.push(text); return Promise.resolve();
+			};
+			return window.Asc.plugin.event_onContextMenuClick({
+				id: 'khmer-ocr-copy-selection', pages: pages
+			}).then(function () {
+				return { copies: copies, rendered: rendered, regions: regionsSeen,
+					destroyed: destroyed, busy: state.running };
+			});
+		};
+		window.copySelectedTextProbe = copyRecognizedSelection;
+	`;
+	const probeWindow = { Asc: { plugin: {} } };
+	const sandbox = { window: probeWindow, console, Promise, setTimeout, clearTimeout,
+		navigator: { clipboard: { writeText: text => { sandbox.copied = text; return Promise.resolve(); } } } };
+	vm.runInNewContext(source.replace(marker, probe + marker), sandbox);
+	assert.equal(typeof probeWindow.Asc.plugin.event_onContextMenuClick, "function",
+		"the plugin must register the event_ callback used by ONLYOFFICE's event bridge");
+	assert.equal(probeWindow.Asc.plugin.onContextMenuClick, undefined);
+	await sandbox.window.copySelectedTextProbe("សួស្តី");
+	assert.equal(sandbox.copied, "សួស្តី", "recognized text is written to clipboard");
+	const quads = [[10, 20, 60, 20, 10, 30, 60, 30]];
+	const result = await probeWindow.runSelectedCopyProbe([
+		{ index: 1, width: 420, height: 595, rotation: 0, quads },
+		{ index: 0, width: 420, height: 595, rotation: 0, quads }
+	]);
+	assert.deepEqual(Array.from(result.rendered), [0, 1]);
+	assert.deepEqual(Array.from(result.copies), ["Khmer page 0\nKhmer page 1"]);
+	assert.deepEqual(Array.from(result.regions, entry => ({ ...entry })), [
+		{ page: 0, regions: 1, width: 100 }, { page: 1, regions: 1, width: 100 }
+	]);
+	assert(result.destroyed && !result.busy, "rendering resources and busy state are released");
+	console.log("Selected-region recognition, page order and clipboard passed");
+}
+
+async function checkEditorClipboardBridge() {
+	const editorWrites = [];
+	const iframeWrites = [];
+	const iframe = { Asc: { plugin: { executeMethod: (name, args, callback) => {
+		assert.equal(name, "CopyKhmerOcrText");
+		editorWrites.push(args[0]);
+		callback(true);
+	} } } };
+	vm.runInNewContext(fs.readFileSync(path.join(__dirname, "code.js"), "utf8"), {
+		window: iframe, console, Promise,
+		navigator: { clipboard: { writeText: text => {
+			iframeWrites.push(text); return Promise.reject(new Error("iframe clipboard denied"));
+		} } }
+	});
+	await iframe.KhmerOcrPlugin.copyRecognizedSelection("សួស្តី");
+	assert.deepEqual(editorWrites, ["សួស្តី"]);
+	assert.equal(iframeWrites.length, 0, "successful editor copy must not use iframe clipboard");
+	console.log("Asynchronous OCR text copied through editor-frame clipboard bridge");
+}
+
 const lines = [
 	{ text: "សទទនុរកម", quads: [10, 20, 70, 20, 10, 30, 70, 30] },
 	{ text: "ពកយចបប់", quads: [74, 20, 130, 20, 74, 30, 130, 30] },
@@ -191,6 +265,17 @@ async function checkRealPdf(enginePath, wasmPath, pdfPath, scannedPath, invitati
 	page.text = file.getText(page.originIndex);
 	const sourceLines = file.copyPageTextWithQuads(0);
 	assert(sourceLines.length >= 10, "source PDF should contain selectable line geometry");
+	editor.Asc = { editor: { getPDFDoc: () => ({ activeDrawing: null }) } };
+	file.Selection = { IsSelection: true, quads: [], Page1: 0, Page2: 0,
+		Line1: 3, Line2: 3, Glyph1: 0, Glyph2: 6 };
+	const partial = file.getSelectionQuads();
+	assert.equal(partial.length, 1);
+	assert.equal(partial[0].page, 0);
+	assert.equal(partial[0].quads.length, 1);
+	assert(partial[0].quads[0][2] - partial[0].quads[0][0] <
+		sourceLines[3].quads[2] - sourceLines[3].quads[0],
+		"editor selection quads should isolate a glyph range within the original line");
+	file.Selection.IsSelection = false;
 	const image = { width: page.W * 2, height: page.H * 2 };
 	const crops = plugin.selectionDetections({ width: page.W, height: page.H, lines: sourceLines }, image);
 	assert(crops.length >= 10, "real editor selection lines should produce recognizer crops");
@@ -287,11 +372,16 @@ async function checkRealPdf(enginePath, wasmPath, pdfPath, scannedPath, invitati
 
 async function main() {
 	checkSavedWorkerPreference();
+	await checkSelectionCopyFlow();
+	await checkEditorClipboardBridge();
 	let getTextCalls = 0;
+	const selectionQuads = [[10, 20, 60, 20, 10, 30, 60, 30]];
 	const file = {
 		pages: [{ W: 420, H: 595, originIndex: 0, text: null }],
 		getText: () => { getTextCalls++; return Uint8Array.of(1); },
-		copyPageTextWithQuads: () => lines
+		copyPageTextWithQuads: () => lines,
+		Selection: { IsSelection: true },
+		getSelectionQuads: () => [{ page: 0, quads: selectionQuads }]
 	};
 	window.Asc.plugin.callCommand = (func, _close, _calc, callback) => {
 		const scope = JSON.stringify(window.Asc.scope);
@@ -307,6 +397,16 @@ async function main() {
 	assert.equal(window.Asc.scope.keep, "previous");
 	assert.equal(window.Asc.scope.pageIndex, undefined);
 	assert.equal(getTextCalls, 1, "load editor text for pages not yet viewed");
+	const selected = await plugin.readSelectedQuads();
+	assert.equal(selected[0].quads.length, 1, "the PDF exposes the exact selected region");
+	const selectionCrops = plugin.selectedDetections(selected[0], image);
+	assert.equal(selectionCrops.length, 1);
+	assert.equal(selectionCrops[0].quad.p1.x, 120,
+		"selected-region OCR must stop at the selected glyph, not the full PDF line");
+	file.Selection.IsSelection = false;
+	assert.equal((await plugin.readSelectedQuads()).length, 0,
+		"no selected PDF text cannot produce OCR regions");
+	file.Selection.IsSelection = true;
 
 	const detections = plugin.selectionDetections(selection, image);
 	assert.equal(detections.length, 2, "adjacent font runs share one recognizer crop");
