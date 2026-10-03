@@ -18,7 +18,7 @@
 	// Bump whenever code.js changes, and keep it in step with the ?v= query in
 	// index.html/config.json. A stale WebView cache silently keeps the old build,
 	// so the running build is shown in the panel header.
-	var PLUGIN_BUILD = "pdf-joined-lines-15";
+	var PLUGIN_BUILD = "pdf-ink-bounds-16";
 
 	var RASTER_MAX_SIDE = 1800;
 	var REVIEW_CONFIDENCE = 0.82;
@@ -671,7 +671,7 @@
 			detections.push({ id: detections.length, quad: quad, sourceText: line.text, score: 1,
 				order: { region: 0, line: detections.length, position: 0 } });
 		});
-		return constrainSelectionCrops(mergeSelectionFragments(detections), image);
+		return constrainSelectionInk(constrainSelectionCrops(mergeSelectionFragments(detections), image), image);
 	}
 
 	// Native PDF extraction can split one visual Khmer line into overlapping
@@ -749,6 +749,52 @@
 			detection.cropQuad = {
 				p0: { x: bounds.left, y: top }, p1: { x: bounds.right, y: top },
 				p2: { x: bounds.right, y: bottom }, p3: { x: bounds.left, y: bottom }
+			};
+		});
+		return detections;
+	}
+
+	// Some embedded fonts report an advance much wider than their painted glyphs.
+	// The editor selects that advance, so trimming to the rendered ink is needed
+	// after merging fragments. Work inside the vertically bounded crop, and keep
+	// a couple of pixels for antialiasing and Khmer marks.
+	function constrainSelectionInk(detections, image) {
+		if (!image.rgba || image.rgba.byteLength !== image.width * image.height * 4) return detections;
+		var pixels = new Uint8ClampedArray(image.rgba);
+		detections.forEach(function (detection) {
+			var box = quadBounds(detection.cropQuad || detection.quad);
+			var height = box.bottom - box.top;
+			var width = box.right - box.left;
+			if (height < 5 || width < 8 ||
+				Math.abs(detection.quad.p1.y - detection.quad.p0.y) > height * 0.08) return;
+			var x0 = Math.max(0, Math.ceil(box.left));
+			var x1 = Math.min(image.width - 1, Math.floor(box.right));
+			var y0 = Math.max(0, Math.ceil(box.top + 1));
+			var y1 = Math.min(image.height - 1, Math.floor(box.bottom - 1));
+			if (x1 <= x0 || y1 <= y0) return;
+			var minInk = Infinity;
+			var maxInk = -Infinity;
+			var minPixels = Math.max(2, Math.floor((y1 - y0) / 16));
+			for (var x = x0; x <= x1; x++) {
+				var count = 0;
+				for (var y = y0; y <= y1; y++) {
+					var offset = (y * image.width + x) * 4;
+					if (pixels[offset + 3] >= 128 &&
+						Math.max(pixels[offset], pixels[offset + 1], pixels[offset + 2]) < 170) count++;
+				}
+				if (count >= minPixels) {
+					minInk = Math.min(minInk, x);
+					maxInk = x;
+				}
+			}
+			if (!Number.isFinite(minInk) || maxInk - minInk < width * 0.35) return;
+			var margin = Math.max(2, Math.ceil(height * 0.05));
+			var left = Math.max(box.left, minInk - margin);
+			var right = Math.min(box.right, maxInk + margin);
+			if (right - left < 8 || (left <= box.left && right >= box.right)) return;
+			detection.cropQuad = {
+				p0: { x: left, y: box.top }, p1: { x: right, y: box.top },
+				p2: { x: right, y: box.bottom }, p3: { x: left, y: box.bottom }
 			};
 		});
 		return detections;

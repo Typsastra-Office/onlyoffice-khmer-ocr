@@ -1,4 +1,4 @@
-// Run with node selection_geometry_harness.cjs [engine.js engine.wasm source.pdf [scanned.pdf [invitation.pdf]]].
+// Run with node selection_geometry_harness.cjs [engine.js engine.wasm source.pdf [scanned.pdf [invitation.pdf [invitation.rgba]]]].
 // The optional PDF exercise uses the real editor selection-quad implementation.
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -58,7 +58,7 @@ async function checkLazyDetector() {
 	assert.deepEqual(created, ["recognizer", "detector"], "image-only page lazily loads PP detection");
 }
 
-async function checkRealPdf(enginePath, wasmPath, pdfPath, scannedPath, invitationPath) {
+async function checkRealPdf(enginePath, wasmPath, pdfPath, scannedPath, invitationPath, rgbaPath) {
 	const wasm = fs.readFileSync(wasmPath);
 	let ready;
 	const loaded = new Promise(resolve => { ready = resolve; });
@@ -163,6 +163,21 @@ async function checkRealPdf(enginePath, wasmPath, pdfPath, scannedPath, invitati
 		assert(subject.length === 1 && (subject[0].quad.p1.x - subject[0].quad.p0.x) > 900,
 			"the invitation subject must be one OCR crop, not many overlapping pieces");
 		console.log(`Invitation PDF: ${fragments.length} text fragments -> ${detections.length} line crops`);
+		if (rgbaPath) {
+			const rgba = fs.readFileSync(rgbaPath);
+			const height = first.H * 2;
+			const width = rgba.length / (height * 4);
+			assert(Number.isInteger(width), "RGBA raster must be 144 DPI and page-sized");
+			const inkCrops = plugin.selectionDetections({ width: first.W, height: first.H, lines: fragments }, {
+				width, height, rgba: rgba.buffer.slice(rgba.byteOffset, rgba.byteOffset + rgba.byteLength)
+			});
+			const row = inkCrops.find(item => Math.abs(item.quad.p0.y / 2 - 288.4) < 3);
+			assert(row && row.cropQuad && row.quad.p1.x / width * first.W > 580 &&
+				row.cropQuad.p1.x / width * first.W < 560,
+				"trim invitation selection to the rendered ink rather than font advance");
+			console.log(`Invitation row right edge: advance ${(row.quad.p1.x / width * first.W).toFixed(1)}pt, ` +
+				`ink ${(row.cropQuad.p1.x / width * first.W).toFixed(1)}pt`);
+		}
 		invite.close();
 	}
 }
@@ -195,6 +210,16 @@ async function main() {
 		p0: { x: 20, y: 40 }, p1: { x: 260, y: 40 },
 		p2: { x: 260, y: 60 }, p3: { x: 20, y: 60 }
 	});
+	const inkImage = { width: 840, height: 1190, rgba: new ArrayBuffer(840 * 1190 * 4) };
+	const ink = new Uint8ClampedArray(inkImage.rgba);
+	ink.fill(255);
+	for (let y = 44; y < 56; y++) for (let x = 22; x < 225; x++) {
+		const offset = (y * inkImage.width + x) * 4;
+		ink[offset] = ink[offset + 1] = ink[offset + 2] = 0;
+	}
+	const trimmed = plugin.selectionDetections(selection, inkImage);
+	assert(trimmed[0].cropQuad && trimmed[0].cropQuad.p1.x < 230 && trimmed[0].quad.p1.x === 260,
+		"oversized PDF advances must not extend the actual OCR and highlight crop");
 	assert.equal(plugin.selectionDetections(null, image).length, 0);
 	assert.equal(plugin.selectionDetections({ width: 420, height: 595, lines: [] }, image).length, 0);
 	assert.equal(plugin.selectionDetections({ ...page, rotation: 180 }, image).length, 0,
@@ -215,8 +240,8 @@ async function main() {
 	await scannedJob;
 	await checkLazyDetector();
 	if (process.argv.length > 2) {
-		assert(process.argv.length >= 5 && process.argv.length <= 7,
-			"provide engine.js engine.wasm source.pdf [scanned.pdf [invitation.pdf]]");
+		assert(process.argv.length >= 5 && process.argv.length <= 8,
+			"provide engine.js engine.wasm source.pdf [scanned.pdf [invitation.pdf [invitation.rgba]]]");
 		await checkRealPdf(...process.argv.slice(2));
 	}
 	console.log("Selection-geometry bridge, crop alignment, and fallback passed");

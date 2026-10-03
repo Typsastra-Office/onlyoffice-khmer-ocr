@@ -18,7 +18,9 @@ OCR runs entirely on the user's machine. No document content is uploaded anywher
   OCR. Legacy Khmer fonts still use image recognition. Adjacent selection boxes
   are bounded at the midpoint between lines before cropping for OCR. Font or
   shaping changes that split a visual line into overlapping PDF text runs are
-  grouped by their shared baseline for one recognition crop.
+  grouped by their shared baseline for one recognition crop. When the PDF font
+  reports a wider box than the actual text, the visible ink bounds the crop and
+  highlight without altering the original source PDF.
 - **Per-line review** in the left panel: each recognized line is listed with its
   confidence. Click a line to highlight its PDF selection or OCR detection box in the PDF editor.
   The view centers the region: the page itself when the page fits the window, and
