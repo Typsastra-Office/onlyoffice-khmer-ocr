@@ -7,6 +7,7 @@
  * Incoming messages:
  *   { type: "init", requestId?, config? }
  *   { type: "process-page", requestId?, page, pageId?, width, height, rgba }
+ *   { type: "detect-page", requestId?, page, pageId?, width, height, rgba }
  *   { type: "recognize-page", requestId?, page, pageId?, width, height, rgba, detections }
  *
  * Every outgoing message includes `requestId`, `page`, and `pageId`. Candidate
@@ -261,6 +262,11 @@ async function handleMessage(message, requestId, page, pageId) {
     return;
   }
 
+  if (message.type === "detect-page") {
+    await processPage(message, requestId, page, pageId, true);
+    return;
+  }
+
   if (message.type === "recognize-page") {
     await recognizePage(message, requestId, page, pageId);
     return;
@@ -413,7 +419,7 @@ function validatedRuntimeConfig(overrides) {
  * @param {*} page
  * @param {*} pageId
  */
-async function processPage(message, requestId, page, pageId) {
+async function processPage(message, requestId, page, pageId, detectionOnly) {
   if (!initialized || !recognizerSession || !vocabulary) {
     throw new Error("OCR worker is not initialized; send {type:'init'} first");
   }
@@ -448,7 +454,13 @@ async function processPage(message, requestId, page, pageId) {
       detections: detections.length
     });
 
-    await recognizeDetections(rgba, width, height, detections, requestId, page, pageId);
+    if (detectionOnly) {
+      postEvent("detections-ready", requestId, page, pageId, {
+        width: width, height: height, detections: detections
+      });
+    } else {
+      await recognizeDetections(rgba, width, height, detections, requestId, page, pageId);
+    }
   } catch (error) {
     postEvent("page-state", requestId, page, pageId, { state: "error" });
     throw withStage(error, "processing page " + String(page));

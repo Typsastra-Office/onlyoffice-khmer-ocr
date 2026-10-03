@@ -30,8 +30,8 @@
                 <button type="button" class="btn ghost" id="btn-clear" disabled>Clear</button>
             </div>
             <div class="bar-row options">
-                <label class="opt" for="opt-threads">
-                    <span>Threads</span>
+                <label class="opt" for="opt-threads" title="Parallel OCR workers on desktop; WASM threads where the host supports them.">
+                    <span id="parallel-label">Parallel workers</span>
                     <select id="opt-threads">
                         <option value="1">1</option>
                         <option value="2">2</option>
@@ -78,6 +78,6 @@
         </footer>
     </div>
 
-    <script type="text/javascript" src="code.js?v=pdf-ink-bounds-16"></script>
+    <script type="text/javascript" src="code.js?v=pdf-parallel-workers-18"></script>
 </body>
 </html>

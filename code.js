@@ -14,11 +14,30 @@
 	"use strict";
 
 	var WORKER_URL = "worker/ocr-worker.js";
-	var WORKER_VERSION = "pdf-latin-lines-14";
+	var WORKER_VERSION = "pdf-parallel-workers-17";
 	// Bump whenever code.js changes, and keep it in step with the ?v= query in
 	// index.html/config.json. A stale WebView cache silently keeps the old build,
 	// so the running build is shown in the panel header.
-	var PLUGIN_BUILD = "pdf-ink-bounds-16";
+	var PLUGIN_BUILD = "pdf-parallel-workers-18";
+	var PARALLELISM_KEY = "typsastra.khmer-ocr.parallel-workers";
+
+	function readWorkerPreference() {
+		try {
+			var value = Number(window.localStorage.getItem(PARALLELISM_KEY));
+			if (Number.isInteger(value) && value >= 1 && value <= 8) return value;
+		} catch (error) {
+			// Local storage may be unavailable in a restricted plugin host.
+		}
+		return 4;
+	}
+
+	function saveWorkerPreference(value) {
+		try {
+			window.localStorage.setItem(PARALLELISM_KEY, String(value));
+		} catch (error) {
+			// The chosen value still applies for the current plugin session.
+		}
+	}
 
 	var RASTER_MAX_SIDE = 1800;
 	var REVIEW_CONFIDENCE = 0.82;
@@ -49,19 +68,22 @@
 
 	var state = {
 		worker: null,
+		workers: [],
+		workerSourcePromise: null,
 		workerReady: false,
 		workerError: null,
 		workerInitPromise: null,
 		engineMessage: "",
-		readyWaiters: [],
+		readyWaiters: {},
 		pageWaiters: {},
+		parallelProgress: null,
 		requestId: 0,
 		running: false,
 		pages: [],
 		status: "Ready",
 		previewMode: "lines",
 		widthStats: null,
-		threads: 4,
+		threads: readWorkerPreference(),
 		effectiveThreads: 0,
 		pdfjs: null,
 		pdfjsPromise: null,
@@ -180,6 +202,8 @@
 		if (el.btnStop) el.btnStop.hidden = !busy;
 		if (el.btnSave) el.btnSave.disabled = busy || !hasPages;
 		if (el.btnClear) el.btnClear.disabled = busy || !hasPages;
+		if (el.threadsSelect) el.threadsSelect.disabled = busy ||
+			(!state.workerReady && !state.workerError);
 		if (el.toolbar) el.toolbar.hidden = !hasPages;
 		if (el.empty) el.empty.hidden = hasPages;
 	}
@@ -454,25 +478,48 @@
 		// The base is the worker folder (the worker resolves assets relative to
 		// itself), not the plugin root.
 		var workerBase = resourceUrl("worker/");
-		return loadText(workerBase + "ocr-worker.js").then(function (source) {
+		if (!state.workerSourcePromise) {
+			state.workerSourcePromise = loadText(workerBase + "ocr-worker.js").catch(function (error) {
+				state.workerSourcePromise = null;
+				throw error;
+			});
+		}
+		return state.workerSourcePromise.then(function (source) {
 			var preamble = "self.__KHMER_OCR_BASE__ = " + JSON.stringify(workerBase) + ";\n" +
 				"self.__KHMER_OCR_LOCAL__ = true;\n" +
 				"self.__KHMER_OCR_THREADS__ = " + JSON.stringify(state.threads) + ";\n";
 			var blob = new Blob([preamble + source], { type: "text/javascript" });
-			return new Worker(URL.createObjectURL(blob));
+			var url = URL.createObjectURL(blob);
+			try {
+				var worker = new Worker(url);
+				worker._ocrBlobUrl = url;
+				return worker;
+			} catch (error) {
+				URL.revokeObjectURL(url);
+				throw error;
+			}
 		});
 	}
 
-	function resetWorker() {
-		if (state.worker) {
-			try { state.worker.terminate(); } catch (ignore) {}
+	function terminateWorker(worker) {
+		try { worker.terminate(); } catch (ignore) {}
+		if (worker._ocrBlobUrl) {
+			URL.revokeObjectURL(worker._ocrBlobUrl);
+			worker._ocrBlobUrl = null;
 		}
+	}
+
+	function resetWorker() {
+		rejectPending(new Error("OCR worker restarted"));
+		state.workers.forEach(terminateWorker);
+		state.workers = [];
 		state.worker = null;
 		state.workerReady = false;
 		state.workerError = null;
 		state.workerInitPromise = null;
 		state.engineMessage = "";
 		state.effectiveThreads = 0;
+		state.parallelProgress = null;
 		updateButtons();
 		setEngine("", "starting engine…");
 		setStatus("Starting OCR engine…");
@@ -481,69 +528,97 @@
 		});
 	}
 
+	function startWorker() {
+		return createWorker().then(function (worker) {
+			state.workers.push(worker);
+			if (!state.worker) state.worker = worker;
+			return new Promise(function (resolve, reject) {
+				var requestId = ++state.requestId;
+				var settled = false;
+				var timeout = setTimeout(function () {
+					var waiter = state.readyWaiters[requestId];
+					if (waiter) waiter.reject(new Error("OCR engine initialization timed out (" +
+						(state.engineMessage || "no progress reported") + ")"));
+				}, 120000);
+				function finish(error, info) {
+					if (settled) return;
+					settled = true;
+					clearTimeout(timeout);
+					delete state.readyWaiters[requestId];
+					if (error) {
+						terminateWorker(worker);
+						reject(error);
+					} else {
+						worker._khmerOcrReady = true;
+						resolve(info);
+					}
+				}
+				state.readyWaiters[requestId] = {
+					resolve: function (info) { finish(null, info); },
+					reject: function (error) { finish(error); }
+				};
+				worker.addEventListener("message", onWorkerMessage);
+				worker.addEventListener("error", function (event) {
+					var error = new Error(event && event.message ? event.message : "OCR worker error");
+					if (!worker._khmerOcrReady) {
+						finish(error);
+						return;
+					}
+					state.workerReady = false;
+					state.workerError = error;
+					rejectPending(error);
+					setEngine("error", "engine failed");
+					setStatus("OCR engine failed: " + error.message);
+					updateButtons();
+				});
+				worker.postMessage({ type: "init", requestId: requestId });
+			});
+		});
+	}
+
 	function ensureWorker() {
 		if (state.workerReady) return Promise.resolve();
 		if (state.workerError) return Promise.reject(state.workerError);
 		if (state.workerInitPromise) return state.workerInitPromise;
-
 		setEngine("busy", "loading OCR models…");
 		setStatus("Loading OCR engine…");
-
-		state.workerInitPromise = createWorker().then(function (worker) {
-			return new Promise(function (resolve, reject) {
-				var settled = false;
-				var timeout = setTimeout(function () {
-					if (settled) return;
-					settled = true;
-					state.workerError = new Error(
-						"OCR engine initialization timed out (" + (state.engineMessage || "no progress reported") + ")"
-					);
-					state.workerInitPromise = null;
-					try { worker.terminate(); } catch (ignore) {}
-					reject(state.workerError);
-				}, 120000);
-
-				function finish(error) {
-					if (settled) return;
-					settled = true;
-					clearTimeout(timeout);
-					if (error) {
-						state.workerError = error;
-						state.workerInitPromise = null;
-						reject(error);
-					} else {
-						state.workerReady = true;
-						state.workerError = null;
-						updateButtons();
-						resolve();
-					}
-				}
-
-				state.worker = worker;
-				state.readyWaiters.push({ resolve: function () { finish(null); } });
-
-				worker.addEventListener("message", onWorkerMessage);
-				worker.addEventListener("error", function (event) {
-					var error = new Error(event && event.message ? event.message : "OCR worker error");
-					state.workerReady = false;
-					state.workerError = error;
-					state.workerInitPromise = null;
-					rejectPending(error);
-					finish(error);
-					setEngine("error", "engine failed");
-					setStatus("OCR engine failed: " + error.message);
-				});
-
-				worker.postMessage({ type: "init", requestId: ++state.requestId });
-			});
+		state.workerInitPromise = startWorker().then(function (primary) {
+			if (primary.wasm && primary.wasm.threads > 1 || state.threads === 1) return primary;
+			var concurrency = navigator.hardwareConcurrency || state.threads;
+			var count = Math.max(1, Math.min(state.threads, concurrency));
+			var starters = [];
+			for (var i = 1; i < count; i++) {
+				starters.push(startWorker().catch(function (error) {
+					console.warn("An OCR worker could not start", error);
+					return null;
+				}));
+			}
+			return Promise.all(starters).then(function () { return primary; });
+		}).then(function (primary) {
+			state.workers = state.workers.filter(function (worker) { return worker._khmerOcrReady; });
+			state.effectiveThreads = primary.wasm && primary.wasm.threads > 1
+				? primary.wasm.threads : state.workers.length;
+			var mode = state.workers.length > 1 ? "workers" : "worker";
+			if (primary.wasm && primary.wasm.threads > 1) mode = "WASM threads";
+			if (el.parallelLabel) el.parallelLabel.textContent =
+				mode === "WASM threads" ? "WASM threads" : "Parallel workers";
+			var label = state.effectiveThreads + " " + mode;
+			setEngine("ready", "engine ready · " + label);
+			setStatus("OCR engine ready (" + label + ")");
+			state.workerReady = true;
+			state.workerError = null;
+			updateButtons();
 		}).catch(function (error) {
+			state.workers.forEach(terminateWorker);
+			state.workers = [];
+			state.worker = null;
 			state.workerError = error;
 			state.workerInitPromise = null;
 			setEngine("error", "engine failed");
 			setStatus("OCR engine failed: " + (error && error.message ? error.message : String(error)));
+			updateButtons();
 			throw error;
 		});
-
 		return state.workerInitPromise;
 	}
 
@@ -553,10 +628,9 @@
 			delete state.pageWaiters[key];
 			waiter.reject(error);
 		});
-		state.readyWaiters.forEach(function (waiter) {
-			waiter.reject(error);
+		Object.keys(state.readyWaiters).forEach(function (key) {
+			state.readyWaiters[key].reject(error);
 		});
-		state.readyWaiters.length = 0;
 	}
 
 	function onWorkerMessage(event) {
@@ -565,14 +639,8 @@
 
 		switch (message.type) {
 			case "ready":
-				state.effectiveThreads = message.wasm && message.wasm.threads ? message.wasm.threads : 1;
-				setEngine("ready", "engine ready · " + state.effectiveThreads + " thread" +
-					(state.effectiveThreads === 1 ? "" : "s"));
-				setStatus("OCR engine ready (" + state.effectiveThreads + " thread" +
-					(state.effectiveThreads === 1 ? "" : "s") + ")");
-				state.readyWaiters.forEach(function (waiter) { waiter.resolve(); });
-				state.readyWaiters.length = 0;
-				updateButtons();
+				if (state.readyWaiters[message.requestId])
+					state.readyWaiters[message.requestId].resolve(message);
 				break;
 			case "engine-progress":
 				state.engineMessage = message.message || message.stage || "working…";
@@ -590,12 +658,21 @@
 				setPageProgress(0, "Detecting text…");
 				break;
 			case "recognition-progress":
-				setPageProgress(
-					message.progress || 0,
-					"Recognizing line " + (message.completed || 0) + " of " + (message.total || 0) + "…"
-				);
+				if (state.parallelProgress &&
+					Object.prototype.hasOwnProperty.call(state.parallelProgress.completed, message.requestId)) {
+					state.parallelProgress.completed[message.requestId] = message.completed || 0;
+					var finished = Object.keys(state.parallelProgress.completed).reduce(function (total, key) {
+						return total + state.parallelProgress.completed[key];
+					}, 0);
+					setPageProgress(finished / Math.max(1, state.parallelProgress.total),
+						"Recognizing line " + finished + " of " + state.parallelProgress.total + "…");
+				} else {
+					setPageProgress(message.progress || 0,
+						"Recognizing line " + (message.completed || 0) + " of " + (message.total || 0) + "…");
+				}
 				break;
-			case "page-ready": {
+			case "page-ready":
+			case "detections-ready": {
 				var waiter = state.pageWaiters[message.requestId];
 				if (waiter) {
 					delete state.pageWaiters[message.requestId];
@@ -610,9 +687,8 @@
 				if (pending) {
 					delete state.pageWaiters[message.requestId];
 					pending.reject(failure);
-				} else {
-					state.readyWaiters.forEach(function (item) { item.reject(failure); });
-					state.readyWaiters.length = 0;
+				} else if (state.readyWaiters[message.requestId]) {
+					state.readyWaiters[message.requestId].reject(failure);
 				}
 				break;
 			}
@@ -621,20 +697,60 @@
 		}
 	}
 
-	function ocrPage(pageIndex, image, detections) {
+	function postPageRequest(worker, pageIndex, image, type, detections, progress) {
 		var requestId = ++state.requestId;
+		if (progress) progress.completed[requestId] = 0;
 		return new Promise(function (resolve, reject) {
 			state.pageWaiters[requestId] = { resolve: resolve, reject: reject };
-			state.worker.postMessage({
-				type: detections.length ? "recognize-page" : "process-page",
+			worker.postMessage({
+				type: type,
 				requestId: requestId,
 				page: pageIndex,
 				pageId: pageIndex,
 				width: image.width,
 				height: image.height,
 				rgba: image.rgba,
-				detections: detections.length ? detections : undefined
+				detections: type === "recognize-page" ? detections : undefined
 			});
+		});
+	}
+
+	function recognizeInParallel(pageIndex, image, detections, workers) {
+		var groups = workers.map(function () { return { positions: [], detections: [] }; });
+		detections.forEach(function (detection, index) {
+			var group = groups[index % workers.length];
+			group.positions.push(index);
+			group.detections.push(detection);
+		});
+		var progress = { completed: {}, total: detections.length };
+		state.parallelProgress = progress;
+		return Promise.all(groups.map(function (group, index) {
+			if (!group.detections.length) return Promise.resolve([]);
+			return postPageRequest(workers[index], pageIndex, image, "recognize-page",
+				group.detections, progress).then(function (message) { return message.lines || []; });
+		})).then(function (groupsOfLines) {
+			var ordered = new Array(detections.length);
+			groupsOfLines.forEach(function (lines, index) {
+				lines.forEach(function (line, position) {
+					ordered[groups[index].positions[position]] = line;
+				});
+			});
+			return { width: image.width, height: image.height,
+				lines: ordered.filter(function (line) { return !!line; }) };
+		}).finally(function () {
+			if (state.parallelProgress === progress) state.parallelProgress = null;
+		});
+	}
+
+	function ocrPage(pageIndex, image, detections) {
+		var workers = state.workers.length ? state.workers : [state.worker];
+		if (workers.length === 1) return postPageRequest(workers[0], pageIndex, image,
+			detections.length ? "recognize-page" : "process-page", detections);
+		if (detections.length) return recognizeInParallel(pageIndex, image, detections, workers);
+		return postPageRequest(workers[0], pageIndex, image, "detect-page", []).then(function (message) {
+			return message.detections && message.detections.length
+				? recognizeInParallel(pageIndex, image, message.detections, workers)
+				: { width: image.width, height: image.height, lines: [] };
 		});
 	}
 
@@ -2575,6 +2691,10 @@
 		el.btnStop = byId("btn-stop");
 		el.btnSave = byId("btn-save");
 		el.btnClear = byId("btn-clear");
+		el.threadsSelect = byId("opt-threads");
+		el.parallelLabel = byId("parallel-label");
+		if (el.parallelLabel && window.crossOriginIsolated)
+			el.parallelLabel.textContent = "WASM threads";
 		el.toolbar = byId("toolbar");
 		el.summary = byId("summary");
 		el.pages = byId("pages");
@@ -2591,13 +2711,14 @@
 		if (byId("btn-accept-all")) byId("btn-accept-all").addEventListener("click", function () { setAllLines("accepted"); });
 		if (byId("btn-reject-all")) byId("btn-reject-all").addEventListener("click", function () { setAllLines("rejected"); });
 
-		var threadsSelect = byId("opt-threads");
+		var threadsSelect = el.threadsSelect;
 		if (threadsSelect) {
 			threadsSelect.value = String(state.threads);
 			threadsSelect.addEventListener("change", function () {
 				var value = Number(this.value);
 				if (!Number.isInteger(value) || value < 1 || value > 8 || value === state.threads) return;
 				state.threads = value;
+				saveWorkerPreference(value);
 				resetWorker();
 			});
 		}
@@ -2659,6 +2780,10 @@
 		selectionDetections: selectionDetections,
 		readSelectionGeometry: readSelectionGeometry,
 		ocrPage: ocrPage,
+		ensureWorker: ensureWorker,
+		resetWorker: resetWorker,
+		readWorkerPreference: readWorkerPreference,
+		saveWorkerPreference: saveWorkerPreference,
 		pdfTextAnchors: pdfTextAnchors,
 		sourceFontForLine: sourceFontForLine,
 		extractedLatinLine: extractedLatinLine

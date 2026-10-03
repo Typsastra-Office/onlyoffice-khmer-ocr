@@ -17,7 +17,7 @@
                 "es": "Reconozca el texto jemer del PDF abierto localmente, revise el resultado línea por línea, rechace las líneas incorrectas y exporte un PDF Unicode (PLU) con búsqueda. La edición de texto está desactivada.",
                 "de": "Erkennen Sie Khmer-Text im geöffneten PDF lokal, prüfen Sie das Ergebnis Zeile für Zeile, verwerfen Sie falsche Zeilen und exportieren Sie ein durchsuchbares Unicode-PDF (PLU). Die Textbearbeitung ist deaktiviert."
             },
-            "url": "index.html?v=pdf-ink-bounds-16",
+            "url": "index.html?v=pdf-parallel-workers-18",
 
             "icons": [
                 {

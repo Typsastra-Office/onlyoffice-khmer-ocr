@@ -38,6 +38,10 @@ OCR runs entirely on the user's machine. No document content is uploaded anywher
   embedded font name and, when the corresponding Unicode font is installed,
   shape cluster advances with it. OCR timing is used automatically when the
   font cannot be identified or loaded; no font choice is required.
+- **Parallel recognition**: the parallelism selector starts independent OCR
+  workers on desktop pages without cross-origin isolation. On an isolated web
+  host, one worker uses the selected number of ONNX Runtime WASM threads. The
+  chosen value is saved in the plugin's local storage for subsequent sessions.
 
 ## Requirements
 

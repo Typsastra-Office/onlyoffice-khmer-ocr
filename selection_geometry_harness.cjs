@@ -7,9 +7,35 @@ const { pathToFileURL } = require("node:url");
 const vm = require("node:vm");
 
 const window = { Asc: { plugin: {}, scope: { keep: "previous" } } };
-const context = { window, console, Promise, setTimeout };
+const context = { window, console, Promise, setTimeout, clearTimeout };
 vm.runInNewContext(fs.readFileSync(path.join(__dirname, "code.js"), "utf8"), context);
 const plugin = window.KhmerOcrPlugin;
+
+function checkSavedWorkerPreference() {
+	const values = new Map();
+	window.localStorage = {
+		getItem: key => values.has(key) ? values.get(key) : null,
+		setItem: (key, value) => values.set(key, value)
+	};
+	plugin.saveWorkerPreference(6);
+	function openPlugin(storage) {
+		const reopened = { Asc: { plugin: {} }, localStorage: storage };
+		vm.runInNewContext(fs.readFileSync(path.join(__dirname, "code.js"), "utf8"),
+			{ window: reopened, console, Promise, setTimeout, clearTimeout });
+		return reopened.KhmerOcrPlugin.state.threads;
+	}
+	assert.equal(openPlugin(window.localStorage), 6, "reopening restores the saved worker count");
+	values.set("typsastra.khmer-ocr.parallel-workers", "99");
+	assert.equal(openPlugin(window.localStorage), 4, "invalid saved counts use the default");
+	assert.equal(openPlugin({ getItem: () => { throw new Error("restricted storage"); } }), 4,
+		"storage denial must not prevent plugin startup");
+	window.localStorage = { getItem: () => null,
+		setItem: () => { throw new Error("restricted storage"); } };
+	assert.doesNotThrow(() => plugin.saveWorkerPreference(3),
+		"saving must not interrupt OCR when local storage is denied");
+	delete window.localStorage;
+	console.log("Worker-count persistence and storage fallback passed");
+}
 
 const lines = [
 	{ text: "សទទនុរកម", quads: [10, 20, 70, 20, 10, 30, 70, 30] },
@@ -21,11 +47,12 @@ const image = { width: 840, height: 1190, rgba: new ArrayBuffer(840 * 1190 * 4) 
 const page = { width: 420, height: 595, lines };
 
 async function checkLazyDetector() {
+	const workerEvents = [];
 	const worker = {
 		URL, console, Promise, Uint8Array, Uint8ClampedArray, ArrayBuffer,
 		navigator: { hardwareConcurrency: 1 },
 		location: { href: "https://localhost/worker/ocr-worker.js" },
-		postMessage: () => {}
+		postMessage: message => workerEvents.push(message)
 	};
 	worker.self = worker;
 	vm.runInNewContext(fs.readFileSync(path.join(__dirname, "worker", "ocr-worker.js"), "utf8"), worker);
@@ -56,6 +83,82 @@ async function checkLazyDetector() {
 	assert.deepEqual(created, ["recognizer"], "PDF selection crops bypass PP detection entirely");
 	await worker.processPage({ page: 0, width: 1, height: 1, rgba: new ArrayBuffer(4) }, 3, 0, 0);
 	assert.deepEqual(created, ["recognizer", "detector"], "image-only page lazily loads PP detection");
+	await worker.processPage({ page: 0, width: 1, height: 1, rgba: new ArrayBuffer(4) }, 4, 0, 0, true);
+	assert(workerEvents.some(event => event.type === "detections-ready" && event.requestId === 4),
+		"detector-only mode returns boxes for recognition in the parallel pool");
+}
+
+async function checkParallelWorkers() {
+	const previousLocation = window.location;
+	window.location = { href: "http://localhost/plugins/khmer-ocr/index.html", protocol: "http:" };
+	context.URL = URL;
+	context.navigator = { hardwareConcurrency: 8 };
+	const detections = [0, 1, 2, 3, 4, 5, 6].map(id => ({ id, quad: {
+		p0: { x: 10, y: id * 20 }, p1: { x: 50, y: id * 20 },
+		p2: { x: 50, y: id * 20 + 10 }, p3: { x: 10, y: id * 20 + 10 }
+	}, order: { region: 0, line: id, position: 0 } }));
+	class FakeWorker {
+		static instances = [];
+		static wasmThreads = 1;
+		constructor() { this.id = FakeWorker.instances.length; this.listeners = []; this.requests = [];
+			this.terminated = false; FakeWorker.instances.push(this); }
+		addEventListener(name, callback) { if (name === "message") this.listeners.push(callback); }
+		emit(message) { this.listeners.forEach(callback => callback({ data: message })); }
+		postMessage(message) {
+			this.requests.push(message);
+			if (message.type === "init") {
+				setTimeout(() => this.emit({ type: "ready", requestId: message.requestId,
+					wasm: { threads: FakeWorker.wasmThreads } }), 0);
+			} else if (message.type === "detect-page") {
+				setTimeout(() => this.emit({ type: "detections-ready", requestId: message.requestId,
+					detections }), 0);
+			} else if (message.type === "recognize-page") {
+				const delay = this.id % 4 === 0 ? 15 : 1;
+				setTimeout(() => {
+					this.emit({ type: "recognition-progress", requestId: message.requestId,
+						completed: message.detections.length, total: message.detections.length });
+					this.emit({ type: "page-ready", requestId: message.requestId,
+						lines: message.detections.map(item => ({ detectionId: item.id,
+							rawText: String(item.id), quad: item.quad, order: item.order })) });
+				}, delay);
+			}
+		}
+		terminate() { this.terminated = true; }
+	}
+	context.Worker = FakeWorker;
+	plugin.state.worker = null;
+	plugin.state.pageWaiters = {};
+	plugin.state.threads = 4;
+	await plugin.ensureWorker();
+	assert.equal(plugin.state.workers.length, 4, "desktop opens four single-thread recognizers");
+	assert.equal(plugin.state.effectiveThreads, 4);
+	let result = await plugin.ocrPage(0, image, detections);
+	assert.deepEqual(Array.from(result.lines, line => line.detectionId), [0, 1, 2, 3, 4, 5, 6],
+		"out-of-order worker completions must restore page reading order");
+	assert.equal(plugin.state.parallelProgress, null);
+	result = await plugin.ocrPage(0, image, []);
+	assert.deepEqual(Array.from(result.lines, line => line.detectionId), [0, 1, 2, 3, 4, 5, 6],
+		"scanned pages detect once and recognize across the worker pool");
+	assert.equal(plugin.state.workers.filter(worker => worker.requests.some(req => req.type === "detect-page")).length, 1);
+
+	const oldWorkers = plugin.state.workers.slice();
+	plugin.state.threads = 2;
+	plugin.resetWorker();
+	await plugin.state.workerInitPromise;
+	assert(oldWorkers.every(worker => worker.terminated), "changing the selector retires the previous pool");
+	assert.equal(plugin.state.workers.length, 2, "new selector value controls the worker count");
+
+	FakeWorker.wasmThreads = 4;
+	plugin.state.threads = 4;
+	plugin.resetWorker();
+	await plugin.state.workerInitPromise;
+	assert.equal(plugin.state.workers.length, 1, "isolated hosts use one multi-threaded WASM worker");
+	assert.equal(plugin.state.effectiveThreads, 4);
+	plugin.state.workers.forEach(worker => worker.terminate());
+	plugin.state.workers = [];
+	plugin.state.worker = null;
+	window.location = previousLocation;
+	console.log("Desktop worker pool, detection fallback, order and selector changes passed");
 }
 
 async function checkRealPdf(enginePath, wasmPath, pdfPath, scannedPath, invitationPath, rgbaPath) {
@@ -183,6 +286,7 @@ async function checkRealPdf(enginePath, wasmPath, pdfPath, scannedPath, invitati
 }
 
 async function main() {
+	checkSavedWorkerPreference();
 	let getTextCalls = 0;
 	const file = {
 		pages: [{ W: 420, H: 595, originIndex: 0, text: null }],
@@ -239,6 +343,7 @@ async function main() {
 	plugin.state.pageWaiters[messages[1].requestId].resolve({ lines: [] });
 	await scannedJob;
 	await checkLazyDetector();
+	await checkParallelWorkers();
 	if (process.argv.length > 2) {
 		assert(process.argv.length >= 5 && process.argv.length <= 8,
 			"provide engine.js engine.wasm source.pdf [scanned.pdf [invitation.pdf [invitation.rgba]]]");
