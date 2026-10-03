@@ -12,7 +12,8 @@ const at = source.lastIndexOf(marker);
 if (at < 0) throw new Error("Plugin IIFE not found");
 const script = source.slice(0, at) +
 	"\nglobalThis.pluTest = { createPdfLogicalFont, drawInvisibleLogicalLine, " +
-	"measureShapedWidths, applyTextLayer, state, advanceTotalFor };\n" +
+	"measureShapedWidths, fontFamilyForPdfName, sourceFontForLine, " +
+	"buildLogicalUnits, applyTextLayer, state, advanceTotalFor };\n" +
 	source.slice(at);
 const globals = {
 	window: { PDFLib, Asc: { plugin: {} } }, console, Promise, Map, Set, Math,
@@ -74,7 +75,7 @@ function quad() {
 	fs.writeFileSync(path.join(out, "plu_reuse.pdf"), await pdf.save());
 	console.log("Wrote reusable-GID PDFium probe for", count, "occurrences");
 
-	// Check the installed-font width path and its safe OCR fallback.
+	// Check automatic font matching and the safe OCR timing fallback.
 	globals.document = { createElement: () => ({ getContext: () => ({
 		font: "", measureText(text) {
 			return { width: text.length * (this.font.includes("TypsastraMissing") ? 1 : 2) };
@@ -84,7 +85,11 @@ function quad() {
 	const measured = plugin.measureShapedWidths(sample, "Khmer OS Muol");
 	check("installed-font widths use whole-line prefix advances",
 		measured && measured[1] > measured[0]);
-	check("OCR timing remains the default", plugin.measureShapedWidths(sample, "ctc") === null);
+	check("unknown source font uses OCR timing", plugin.measureShapedWidths(sample, null) === null);
+	check("PDF subset name resolves to installed CSS family",
+		plugin.fontFamilyForPdfName("OFWZZA+KhmerOSMuolLight") === "Khmer OS Muol Light");
+	check("generic pdf.js font does not pretend to identify a Khmer face",
+		plugin.fontFamilyForPdfName("sans-serif") === null);
 	globals.document.createElement = () => ({ getContext: () => ({
 		font: "", measureText(text) { return { width: text.length }; },
 	}) });
@@ -97,10 +102,13 @@ function quad() {
 		},
 	}) });
 	const pagesPdf = await PDFLib.PDFDocument.create();
-	plugin.state.widthFont = "Khmer OS Muol";
+	function sourceAnchor(name) {
+		return { fontSourceName: name, bounds: { left: 50, right: 500, top: 210, bottom: 240 },
+			baselineStart: { x: 50, y: 240 }, baselineEnd: { x: 500, y: 240 }, height: 30 };
+	}
 	plugin.state.pages = [0, 1].map((index) => ({
 		index, width: 595, height: 842, pdfWidth: 595, pdfHeight: 842,
-		sourceTextAnchors: [],
+		sourceTextAnchors: [sourceAnchor(index ? "BNTIUL+KhmerOSMuol" : "OFWZZA+KhmerOSMuolLight")],
 		lines: [{ status: "accepted", rawText: "សទ្ទា", ctcContentLength: 3,
 			units: [
 				{ rawText: "ស", timestepStart: 0, timestepEnd: 1 },
@@ -108,9 +116,14 @@ function quad() {
 			], quad: quad(),
 		}],
 	}));
+	plugin.state.pages[1].sourceTextAnchors = [sourceAnchor("sans-serif")];
+	plugin.buildLogicalUnits();
+	check("unknown second-page font falls back per line", plugin.state.widthStats.shaped === 1 &&
+		plugin.state.widthStats.fallback === 1);
+	plugin.state.pages[1].sourceTextAnchors = [sourceAnchor("BNTIUL+KhmerOSMuol")];
 	plugin.state.pages.forEach(() => pagesPdf.addPage([595, 842]));
 	await plugin.applyTextLayer(pagesPdf);
-	check("font-mode selected for both pages", plugin.state.widthStats.shaped === 2);
+	check("matching source fonts selected automatically on both pages", plugin.state.widthStats.shaped === 2);
 	fs.writeFileSync(path.join(out, "plu_pages.pdf"), await pagesPdf.save());
 	console.log("Wrote two-page complete export-path probe");
 })().catch((error) => { console.error(error); process.exitCode = 1; });

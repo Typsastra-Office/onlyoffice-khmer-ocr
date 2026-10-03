@@ -3,6 +3,7 @@
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const { pathToFileURL } = require("node:url");
 const vm = require("node:vm");
 
 const window = { Asc: { plugin: {}, scope: { keep: "previous" } } };
@@ -99,6 +100,19 @@ async function checkRealPdf(enginePath, wasmPath, pdfPath, scannedPath) {
 		"selection geometry must be expressed in the editor's page dimensions");
 	console.log(`Original PDF: ${sourceLines.length} selection runs -> ${crops.length} recognizer crops`);
 	file.close();
+	const pdfjs = await import(pathToFileURL(path.join(__dirname, "vendor", "pdfjs", "pdf.min.js")).href);
+	pdfjs.GlobalWorkerOptions.workerSrc = pathToFileURL(path.join(__dirname, "vendor", "pdfjs", "pdf.worker.min.js")).href;
+	const source = await pdfjs.getDocument({ data: new Uint8Array(pdf), disableWorker: true }).promise;
+	const sourcePage = await source.getPage(1);
+	await sourcePage.getOperatorList();
+	const textContent = await sourcePage.getTextContent();
+	const viewport = sourcePage.getViewport({ scale: 2 });
+	const anchors = plugin.pdfTextAnchors(textContent, viewport, pdfjs.Util, sourcePage);
+	const titleQuad = plugin.selectionDetections({ width: page.W, height: page.H, lines: [title] }, image)[0].quad;
+	assert.equal(plugin.sourceFontForLine({ sourceTextAnchors: anchors }, titleQuad), "Khmer OS Muol Light",
+		"match the broken-Khmer title to its actual PDF embedded font name");
+	console.log("Original PDF title font: Khmer OS Muol Light (automatic)");
+	await source.destroy();
 	if (scannedPath) {
 		const bytes = fs.readFileSync(scannedPath);
 		const scanned = editor.AscViewer.createFile(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));

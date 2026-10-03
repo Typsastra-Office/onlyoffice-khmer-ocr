@@ -26,6 +26,10 @@ OCR runs entirely on the user's machine. No document content is uploaded anywher
   with exact per-chunk `ToUnicode` mappings to the **original PDF pages**, so the
   document keeps its original quality and the Khmer text becomes selectable,
   searchable and copyable.
+- **Automatic text widths**: match each recognized line to the original PDF's
+  embedded font name and, when the corresponding Unicode font is installed,
+  shape cluster advances with it. OCR timing is used automatically when the
+  font cannot be identified or loaded; no font choice is required.
 
 ## Requirements
 

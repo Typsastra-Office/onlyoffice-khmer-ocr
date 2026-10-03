@@ -18,7 +18,7 @@
 	// Bump whenever code.js changes, and keep it in step with the ?v= query in
 	// index.html/config.json. A stale WebView cache silently keeps the old build,
 	// so the running build is shown in the panel header.
-	var PLUGIN_BUILD = "pdf-selection-recognition-12";
+	var PLUGIN_BUILD = "pdf-auto-width-13";
 
 	var RASTER_MAX_SIDE = 1800;
 	var REVIEW_CONFIDENCE = 0.82;
@@ -60,7 +60,6 @@
 		pages: [],
 		status: "Ready",
 		previewMode: "lines",
-		widthFont: "ctc",
 		widthStats: null,
 		threads: 4,
 		effectiveThreads: 0,
@@ -874,7 +873,7 @@
 			return page.render({ canvasContext: context, viewport: viewport }).promise
 				.then(function () {
 					return page.getTextContent().then(function (textContent) {
-						return pdfTextAnchors(textContent, viewport, state.pdfjs.Util);
+						return pdfTextAnchors(textContent, viewport, state.pdfjs.Util, page);
 					}).catch(function () {
 						return [];
 					});
@@ -1124,12 +1123,23 @@
 	/**
 	 * Text anchors extracted from the PDF's own text via pdf.js (raster space).
 	 */
-	function pdfTextAnchors(textContent, viewport, pdfjsUtil) {
+	function pdfTextAnchors(textContent, viewport, pdfjsUtil, pdfPage) {
 		var items = (textContent && textContent.items) ? textContent.items : [];
 		var anchors = [];
+		var fontNames = {};
 		for (var index = 0; index < items.length; index++) {
 			var item = items[index];
 			if (!item || !item.str || !Array.isArray(item.transform)) continue;
+			if (!Object.prototype.hasOwnProperty.call(fontNames, item.fontName)) {
+				try {
+					// styles[item.fontName].fontFamily is often only "sans-serif".
+					// After render, the actual PDF subset name is in commonObjs.
+					var font = pdfPage.commonObjs.get(item.fontName);
+					fontNames[item.fontName] = font && font.name || "";
+				} catch (error) {
+					fontNames[item.fontName] = "";
+				}
+			}
 			var matrix = pdfjsUtil.transform(viewport.transform, item.transform);
 			var horizontalLength = Math.hypot(matrix[0], matrix[1]);
 			var verticalLength = Math.hypot(matrix[2], matrix[3]);
@@ -1149,6 +1159,7 @@
 			anchors.push({
 				id: index,
 				corruptText: item.str,
+				fontSourceName: fontNames[item.fontName],
 				width: width,
 				height: height,
 				baselineStart: baselineStart,
@@ -1500,6 +1511,54 @@
 		});
 	}
 
+	// PDF font names usually include a six-letter subset prefix. Only map names
+	// whose local CSS family is known; legacy embedded glyphs cannot be used to
+	// shape the newly recognized Unicode just because the names look similar.
+	function fontFamilyForPdfName(name) {
+		var normalized = String(name || "").replace(/^[A-Z]{6}\+/, "")
+			.replace(/[-,]Regular$/i, "").replace(/\s/g, "").toLowerCase();
+		var families = {
+			khmerossystem: "Khmer OS System",
+			khmerosmuol: "Khmer OS Muol",
+			khmerosmuollight: "Khmer OS Muol Light",
+			khmerosmuolpali: "Khmer OS Muol Pali",
+			khmernettra: "Khmer Nettra",
+			notosanskhmer: "Noto Sans Khmer"
+		};
+		return Object.prototype.hasOwnProperty.call(families, normalized)
+			? families[normalized] : null;
+	}
+
+	function sourceFontForLine(page, lineQuad) {
+		var anchors = page && page.sourceTextAnchors || [];
+		if (!lineQuad || !anchors.length) return null;
+		var line = quadBounds(lineQuad);
+		var lineWidth = line.right - line.left;
+		var lineHeight = line.bottom - line.top;
+		if (lineWidth <= 0 || lineHeight <= 0) return null;
+		var scores = Object.create(null);
+		anchors.forEach(function (anchor) {
+			var family = fontFamilyForPdfName(anchor.fontSourceName);
+			if (!family || !anchor.bounds) return;
+			var bounds = anchor.bounds;
+			var overlapX = Math.max(0, Math.min(line.right, bounds.right) - Math.max(line.left, bounds.left));
+			var overlapY = Math.max(0, Math.min(line.bottom, bounds.bottom) - Math.max(line.top, bounds.top));
+			var anchorHeight = bounds.bottom - bounds.top;
+			if (overlapX <= 0 || anchorHeight <= 0 ||
+				overlapY / Math.min(lineHeight, anchorHeight) < 0.4) return;
+			scores[family] = (scores[family] || 0) + overlapX;
+		});
+		var best = null;
+		var bestWidth = lineWidth * 0.35;
+		Object.keys(scores).forEach(function (family) {
+			if (scores[family] > bestWidth) {
+				best = family;
+				bestWidth = scores[family];
+			}
+		});
+		return best;
+	}
+
 	function buildLogicalUnits() {
 		var units = [];
 		state.widthStats = { shaped: 0, fallback: 0 };
@@ -1514,11 +1573,12 @@
 					return { unicode: chunk.unicode, start: chunk.start, end: chunk.end, id: chunkId++ };
 				});
 				if (!chunks.length) return;
-				var shapedWidths = measureShapedWidths(chunks, state.widthFont);
+				var fontFamily = sourceFontForLine(page, line.quad || line.alignmentQuad);
+				var shapedWidths = measureShapedWidths(chunks, fontFamily);
 				if (shapedWidths) chunks.forEach(function (chunk, index) {
 					chunk.advance = shapedWidths[index];
 				});
-				if (state.widthFont !== "ctc" && /[\u1780-\u17ff]/.test(unicode)) {
+				if (/[\u1780-\u17ff]/.test(unicode)) {
 					state.widthStats[shapedWidths ? "shaped" : "fallback"]++;
 				}
 				units.push({
@@ -1915,10 +1975,11 @@
 	 * their normal context. Prefix advances locate grapheme boundaries; measuring
 	 * isolated glyphs would give the wrong width for subscript consonants. The
 	 * synthetic PDF font remains one CID per cluster regardless of this choice.
-	 * Font choice is explicit: source PDF subset names often conceal the face.
+	 * The source PDF font is used only when its subset name maps to an installed
+	 * Unicode font. Otherwise OCR timing supplies the cluster widths.
 	 */
 	function measureShapedWidths(chunks, family) {
-		if (!family || family === "ctc" || !chunks.length ||
+		if (!family || !chunks.length ||
 			!chunks.some(function (chunk) { return /[\u1780-\u17ff]/.test(chunk.unicode); }) ||
 			chunks.some(function (chunk) { return /[A-Za-z]/.test(chunk.unicode); }) ||
 			typeof document === "undefined") return null;
@@ -2310,8 +2371,8 @@
 				setProgress(1, "PLU PDF ready");
 				setStatus("PLU PDF created: " + state.logicalUnitCount + " line(s)" +
 					(usedOriginal ? ", original page quality kept" : "") +
-					(state.widthFont !== "ctc" && state.widthStats ?
-						", font widths on " + state.widthStats.shaped + " Khmer line(s)" +
+					(state.widthStats && state.widthStats.shaped ?
+						", matched-font widths on " + state.widthStats.shaped + " Khmer line(s)" +
 						(state.widthStats.fallback ? ", OCR timing on " +
 							state.widthStats.fallback + " line(s)" : "") : "") + ".");
 				window.setTimeout(function () { setProgress(null); }, 2500);
@@ -2367,13 +2428,6 @@
 		if (byId("btn-reject-all")) byId("btn-reject-all").addEventListener("click", function () { setAllLines("rejected"); });
 
 		var threadsSelect = byId("opt-threads");
-		var widthSelect = byId("opt-width-font");
-		if (widthSelect) {
-			widthSelect.value = state.widthFont;
-			widthSelect.addEventListener("change", function () {
-				state.widthFont = this.value;
-			});
-		}
 		if (threadsSelect) {
 			threadsSelect.value = String(state.threads);
 			threadsSelect.addEventListener("change", function () {
@@ -2440,6 +2494,8 @@
 		clear: clearAll,
 		selectionDetections: selectionDetections,
 		readSelectionGeometry: readSelectionGeometry,
-		ocrPage: ocrPage
+		ocrPage: ocrPage,
+		pdfTextAnchors: pdfTextAnchors,
+		sourceFontForLine: sourceFontForLine
 	};
 })(window, undefined);
