@@ -13,6 +13,12 @@ OCR runs entirely on the user's machine. No document content is uploaded anywher
   the PDF editor's line-selection geometry to crop the visible text for OCR even
   when the embedded Khmer Unicode is broken. Pages without usable selection
   geometry use the PP-OCRv6 detector.
+- **Preserve readable Latin text**: when a selectable line contains valid Latin
+  Unicode from a Latin PDF font, take its text directly instead of re-running
+  OCR. Legacy Khmer fonts still use image recognition. Adjacent selection boxes
+  are bounded at the midpoint between lines before cropping for OCR. Font or
+  shaping changes that split a visual line into overlapping PDF text runs are
+  grouped by their shared baseline for one recognition crop.
 - **Per-line review** in the left panel: each recognized line is listed with its
   confidence. Click a line to highlight its PDF selection or OCR detection box in the PDF editor.
   The view centers the region: the page itself when the page fits the window, and

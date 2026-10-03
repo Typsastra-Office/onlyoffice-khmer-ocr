@@ -126,4 +126,18 @@ function quad() {
 	check("matching source fonts selected automatically on both pages", plugin.state.widthStats.shaped === 2);
 	fs.writeFileSync(path.join(out, "plu_pages.pdf"), await pagesPdf.save());
 	console.log("Wrote two-page complete export-path probe");
+
+	const latinPdf = await PDFLib.PDFDocument.create();
+	const latinPage = latinPdf.addPage([595, 842]);
+	let addedRuns = 0;
+	const addRun = latinPage.pushOperators.bind(latinPage);
+	latinPage.pushOperators = (...operators) => { addedRuns++; return addRun(...operators); };
+	plugin.state.pages = [{ index: 0, width: 595, height: 842, pdfWidth: 595, pdfHeight: 842,
+		sourceTextAnchors: [], lines: [{ status: "accepted", source: "pdf-text",
+			rawText: "Fr. membre actif", units: [], quad: quad() }] }];
+	await plugin.applyTextLayer(latinPdf, true);
+	check("extractable Latin remains on the original PDF without duplicate overlay",
+		addedRuns === 0 && plugin.state.logicalUnitCount === 1);
+	await plugin.applyTextLayer(latinPdf, false);
+	check("Latin is embedded when only a raster export is available", addedRuns > 0);
 })().catch((error) => { console.error(error); process.exitCode = 1; });

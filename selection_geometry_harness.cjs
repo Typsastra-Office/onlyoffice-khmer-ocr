@@ -1,4 +1,4 @@
-// Run with node selection_geometry_harness.cjs [engine.js engine.wasm source.pdf [scanned.pdf]].
+// Run with node selection_geometry_harness.cjs [engine.js engine.wasm source.pdf [scanned.pdf [invitation.pdf]]].
 // The optional PDF exercise uses the real editor selection-quad implementation.
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -58,7 +58,7 @@ async function checkLazyDetector() {
 	assert.deepEqual(created, ["recognizer", "detector"], "image-only page lazily loads PP detection");
 }
 
-async function checkRealPdf(enginePath, wasmPath, pdfPath, scannedPath) {
+async function checkRealPdf(enginePath, wasmPath, pdfPath, scannedPath, invitationPath) {
 	const wasm = fs.readFileSync(wasmPath);
 	let ready;
 	const loaded = new Promise(resolve => { ready = resolve; });
@@ -99,6 +99,17 @@ async function checkRealPdf(enginePath, wasmPath, pdfPath, scannedPath) {
 		coordinate <= (index % 2 ? page.H : page.W)),
 		"selection geometry must be expressed in the editor's page dimensions");
 	console.log(`Original PDF: ${sourceLines.length} selection runs -> ${crops.length} recognizer crops`);
+	const glossaryPage = file.pages[2];
+	glossaryPage.text = file.getText(glossaryPage.originIndex);
+	const glossaryLines = file.copyPageTextWithQuads(2);
+	const glossaryImage = { width: glossaryPage.W * 2, height: glossaryPage.H * 2 };
+	const glossaryCrops = plugin.selectionDetections({ width: glossaryPage.W, height: glossaryPage.H,
+		lines: glossaryLines }, glossaryImage);
+	const english = glossaryCrops.find(crop => crop.sourceText.includes("Eng. active member"));
+	const french = glossaryCrops.find(crop => crop.sourceText.includes("Fr.") && crop.sourceText.includes("membre actif"));
+	assert(english && french && french.cropQuad, "overlapping English and French selection boxes must be separable");
+	assert(french.cropQuad.p0.y >= (english.cropQuad || english.quad).p2.y - 1,
+		"French crop must no longer include the English line above it");
 	file.close();
 	const pdfjs = await import(pathToFileURL(path.join(__dirname, "vendor", "pdfjs", "pdf.min.js")).href);
 	pdfjs.GlobalWorkerOptions.workerSrc = pathToFileURL(path.join(__dirname, "vendor", "pdfjs", "pdf.worker.min.js")).href;
@@ -112,6 +123,17 @@ async function checkRealPdf(enginePath, wasmPath, pdfPath, scannedPath) {
 	assert.equal(plugin.sourceFontForLine({ sourceTextAnchors: anchors }, titleQuad), "Khmer OS Muol Light",
 		"match the broken-Khmer title to its actual PDF embedded font name");
 	console.log("Original PDF title font: Khmer OS Muol Light (automatic)");
+	const glossaryPdfPage = await source.getPage(3);
+	await glossaryPdfPage.getOperatorList();
+	const glossaryContent = await glossaryPdfPage.getTextContent();
+	const glossaryAnchors = plugin.pdfTextAnchors(glossaryContent,
+		glossaryPdfPage.getViewport({ scale: 2 }), pdfjs.Util, glossaryPdfPage);
+	assert.equal(plugin.extractedLatinLine(english, glossaryAnchors).rawText, "Eng. active member");
+	assert.equal(plugin.extractedLatinLine(french, glossaryAnchors).rawText, "Fr. membre actif");
+	const legacyKhmer = glossaryCrops.find(crop => crop.sourceText.includes("kmμiksmaCik"));
+	assert(legacyKhmer && !plugin.extractedLatinLine(legacyKhmer, glossaryAnchors),
+		"legacy Khmer encoded with Latin characters must still use OCR");
+	console.log("Glossary page: Latin lines extracted directly; legacy Khmer stays in OCR");
 	await source.destroy();
 	if (scannedPath) {
 		const bytes = fs.readFileSync(scannedPath);
@@ -125,6 +147,23 @@ async function checkRealPdf(enginePath, wasmPath, pdfPath, scannedPath) {
 			{ width: first.W * 2, height: first.H * 2 }).length, 0);
 		console.log("Scanned PDF: no selection runs -> PP detector fallback");
 		scanned.close();
+	}
+	if (invitationPath) {
+		const bytes = fs.readFileSync(invitationPath);
+		const invite = editor.AscViewer.createFile(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+		assert(invite && invite.pages.length > 0);
+		const first = invite.pages[0];
+		first.text = invite.getText(first.originIndex);
+		const fragments = invite.copyPageTextWithQuads(0);
+		const detections = plugin.selectionDetections({ width: first.W, height: first.H, lines: fragments },
+			{ width: first.W * 2, height: first.H * 2 });
+		const subject = detections.filter(item => Math.abs(item.quad.p0.y / 2 - 236.1) < 3);
+		assert(fragments.length > 150 && detections.length < fragments.length / 3,
+			"fragmented selectable Khmer runs should become full visual lines");
+		assert(subject.length === 1 && (subject[0].quad.p1.x - subject[0].quad.p0.x) > 900,
+			"the invitation subject must be one OCR crop, not many overlapping pieces");
+		console.log(`Invitation PDF: ${fragments.length} text fragments -> ${detections.length} line crops`);
+		invite.close();
 	}
 }
 
@@ -176,8 +215,8 @@ async function main() {
 	await scannedJob;
 	await checkLazyDetector();
 	if (process.argv.length > 2) {
-		assert(process.argv.length === 5 || process.argv.length === 6,
-			"provide engine.js engine.wasm source.pdf [scanned.pdf]");
+		assert(process.argv.length >= 5 && process.argv.length <= 7,
+			"provide engine.js engine.wasm source.pdf [scanned.pdf [invitation.pdf]]");
 		await checkRealPdf(...process.argv.slice(2));
 	}
 	console.log("Selection-geometry bridge, crop alignment, and fallback passed");

@@ -990,7 +990,11 @@ function assignReadingOrder(detections) {
  * @returns {Promise<{line: RecognizedLine, inferenceMs: number}>}
  */
 async function recognizeDetection(rgba, pageWidth, pageHeight, detection) {
-  var cropQuad = paddedRecognizerQuad(straightenNearAxisQuad(detection.quad));
+  // A crop already bounded by neighbouring PDF text baselines must not be
+  // padded back into the next line. Detector boxes still need their padding.
+  var cropQuad = detection.cropQuad
+    ? straightenNearAxisQuad(detection.cropQuad)
+    : paddedRecognizerQuad(straightenNearAxisQuad(detection.quad));
   var crop = sampleRecognizerCrop(rgba, pageWidth, pageHeight, cropQuad);
   var imageTensor = new ort.Tensor("float32", crop.data, [1, 1, RECOGNIZER_HEIGHT, crop.width]);
   var widthTensor = new ort.Tensor("int64", new BigInt64Array([BigInt(crop.width)]), [1]);
@@ -1027,7 +1031,7 @@ async function recognizeDetection(rgba, pageWidth, pageHeight, detection) {
     return {
       line: {
         detectionId: detection.id,
-        quad: detection.quad,
+        quad: detection.cropQuad || detection.quad,
         units: decoded.units,
         rawText: decoded.rawText,
         confidence: decoded.confidence,

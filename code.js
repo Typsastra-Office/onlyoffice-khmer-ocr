@@ -14,11 +14,11 @@
 	"use strict";
 
 	var WORKER_URL = "worker/ocr-worker.js";
-	var WORKER_VERSION = "pdf-selection-recognition-12";
+	var WORKER_VERSION = "pdf-latin-lines-14";
 	// Bump whenever code.js changes, and keep it in step with the ?v= query in
 	// index.html/config.json. A stale WebView cache silently keeps the old build,
 	// so the running build is shown in the panel header.
-	var PLUGIN_BUILD = "pdf-auto-width-13";
+	var PLUGIN_BUILD = "pdf-joined-lines-15";
 
 	var RASTER_MAX_SIDE = 1800;
 	var REVIEW_CONFIDENCE = 0.82;
@@ -642,7 +642,8 @@
 	 * The editor's copyPageTextWithQuads coordinates are page units with a
 	 * top-left origin. Convert to the rendered page's pixels, and reorder its
 	 * TL, TR, BL, BR corners to the recognizer's TL, TR, BR, BL convention.
-	 * Broken extracted text is used only to identify nonempty selectable lines.
+	 * The extracted text is retained for reliable Latin lines; legacy Khmer
+	 * encodings still need recognition from the page image.
 	 */
 	function selectionDetections(selection, image) {
 		if (!selection || !Array.isArray(selection.lines) || !image ||
@@ -667,42 +668,123 @@
 			var height = Math.hypot(quad.p3.x - quad.p0.x, quad.p3.y - quad.p0.y);
 			if (width < 2 || height < 2 || bounds.right <= 0 || bounds.bottom <= 0 ||
 				bounds.left >= image.width || bounds.top >= image.height) return;
-			detections.push({ id: detections.length, quad: quad, score: 1,
+			detections.push({ id: detections.length, quad: quad, sourceText: line.text, score: 1,
 				order: { region: 0, line: detections.length, position: 0 } });
 		});
-		return mergeSelectionFragments(detections);
+		return constrainSelectionCrops(mergeSelectionFragments(detections), image);
 	}
 
-	// PDF font runs can split one visual line. Merge nearby horizontal runs
-	// while leaving separate columns and rotated text as individual crops.
+	// Native PDF extraction can split one visual Khmer line into overlapping
+	// runs (a mark or font switch often resets the run's x). Group by actual
+	// row height and position, using only a small allowed horizontal gap so
+	// different columns stay separate.
 	function mergeSelectionFragments(detections) {
 		var result = [];
 		detections.forEach(function (detection) {
-			var previous = result[result.length - 1];
-			var a = previous && quadBounds(previous.quad);
 			var b = quadBounds(detection.quad);
-			var ha = a && a.bottom - a.top;
 			var hb = b.bottom - b.top;
-			var gap = a && b.left - a.right;
-			var sameLine = a && Math.abs(previous.quad.p1.y - previous.quad.p0.y) < ha * 0.08 &&
-				Math.abs(detection.quad.p1.y - detection.quad.p0.y) < hb * 0.08 &&
-				Math.max(ha, hb) / Math.min(ha, hb) < 1.35 &&
-				Math.abs((a.top + a.bottom) - (b.top + b.bottom)) < Math.min(ha, hb) * 0.4 &&
-				gap >= -Math.min(ha, hb) * 0.2 && gap <= Math.min(ha, hb) * 1.5;
-			if (sameLine) {
-				previous.quad = {
-					p0: { x: a.left, y: Math.min(a.top, b.top) },
-					p1: { x: b.right, y: Math.min(a.top, b.top) },
-					p2: { x: b.right, y: Math.max(a.bottom, b.bottom) },
-					p3: { x: a.left, y: Math.max(a.bottom, b.bottom) }
+			var best = null;
+			var bestGap = Infinity;
+			for (var i = 0; i < result.length; i++) {
+				var candidate = result[i];
+				var a = quadBounds(candidate.quad);
+				var ha = a.bottom - a.top;
+				var minHeight = Math.min(ha, hb);
+				var gap = Math.max(0, b.left - a.right, a.left - b.right);
+				if (Math.abs(candidate.quad.p1.y - candidate.quad.p0.y) > ha * 0.08 ||
+					Math.abs(detection.quad.p1.y - detection.quad.p0.y) > hb * 0.08 ||
+					Math.max(ha, hb) / minHeight > 1.35 ||
+					Math.abs(candidate._rowTop - b.top) > minHeight * 0.25 ||
+					gap > minHeight || gap >= bestGap) continue;
+				best = candidate;
+				bestGap = gap;
+			}
+			if (best) {
+				var bounds = quadBounds(best.quad);
+				best.sourceText += detection.sourceText;
+				best.quad = {
+					p0: { x: Math.min(bounds.left, b.left), y: Math.min(bounds.top, b.top) },
+					p1: { x: Math.max(bounds.right, b.right), y: Math.min(bounds.top, b.top) },
+					p2: { x: Math.max(bounds.right, b.right), y: Math.max(bounds.bottom, b.bottom) },
+					p3: { x: Math.min(bounds.left, b.left), y: Math.max(bounds.bottom, b.bottom) }
 				};
 			} else {
 				detection.id = result.length;
 				detection.order.line = result.length;
+				detection._rowTop = b.top;
 				result.push(detection);
 			}
 		});
+		result.forEach(function (detection) { delete detection._rowTop; });
 		return result;
+	}
+
+	// The PDF font box can cross the next baseline even when the visible ink
+	// does not. Bound each recognizer crop by the halfway point to nearby runs
+	// in the same column. Preserve the unmodified quad for source-font matching.
+	function constrainSelectionCrops(detections, image) {
+		detections.forEach(function (detection) {
+			var bounds = quadBounds(detection.quad);
+			var height = bounds.bottom - bounds.top;
+			var width = bounds.right - bounds.left;
+			if (height <= 0 || width <= 0 ||
+				Math.abs(detection.quad.p1.y - detection.quad.p0.y) > height * 0.08) return;
+			var center = (bounds.top + bounds.bottom) / 2;
+			var above = -Infinity;
+			var below = Infinity;
+			detections.forEach(function (other) {
+				if (other === detection) return;
+				var neighbor = quadBounds(other.quad);
+				var overlap = Math.max(0, Math.min(bounds.right, neighbor.right) -
+					Math.max(bounds.left, neighbor.left));
+				if (overlap < Math.min(width, neighbor.right - neighbor.left) * 0.35) return;
+				var neighborCenter = (neighbor.top + neighbor.bottom) / 2;
+				if (neighborCenter < center - 2) above = Math.max(above, neighborCenter);
+				if (neighborCenter > center + 2) below = Math.min(below, neighborCenter);
+			});
+			var top = Math.max(0, bounds.top, (above + center) / 2);
+			var bottom = Math.min(image.height, bounds.bottom, (below + center) / 2);
+			if (bottom - top < Math.max(4, height * 0.4) ||
+				(top <= bounds.top && bottom >= bounds.bottom)) return;
+			detection.cropQuad = {
+				p0: { x: bounds.left, y: top }, p1: { x: bounds.right, y: top },
+				p2: { x: bounds.right, y: bottom }, p3: { x: bounds.left, y: bottom }
+			};
+		});
+		return detections;
+	}
+
+	/** Return the PDF's own text only when both its Unicode and font are credible. */
+	function extractedLatinLine(detection, anchors) {
+		var text = String(detection.sourceText || "").replace(/[\s\uFFFF]+/g, " ").trim();
+		if (!/[A-Za-z\u00C0-\u024F]/.test(text) ||
+			/[^\u0020-\u007E\u00C0-\u024F\u1E00-\u1EFF\u2010-\u201F\u2026\u20AC]/.test(text) ||
+			!Array.isArray(anchors)) return null;
+		var bounds = quadBounds(detection.quad);
+		var lineWidth = bounds.right - bounds.left;
+		var matchedWidth = 0;
+		anchors.forEach(function (anchor) {
+			var font = String(anchor.fontSourceName || "").replace(/^[A-Z]{6}\+/, "");
+			if (!/^(?:Times|Arial|Helvetica|Courier|Calibri|Cambria|Georgia|Garamond|Verdana|Tahoma|Liberation(?:Sans|Serif)|Noto(?:Sans|Serif)|Roboto|OpenSans|Inter)/i.test(font) ||
+				!anchor.bounds || !anchor.corruptText) return;
+			var fragment = String(anchor.corruptText).replace(/\s+/g, " ").trim();
+			if (!fragment || text.indexOf(fragment) === -1) return;
+			var rect = anchor.bounds;
+			var overlapX = Math.max(0, Math.min(bounds.right, rect.right) - Math.max(bounds.left, rect.left));
+			var overlapY = Math.max(0, Math.min(bounds.bottom, rect.bottom) - Math.max(bounds.top, rect.top));
+			if (overlapY <= 0) return;
+			matchedWidth += overlapX;
+		});
+		if (lineWidth <= 0 || matchedWidth < lineWidth * 0.45) return null;
+		return {
+			detectionId: detection.id,
+			quad: detection.cropQuad || detection.quad,
+			units: [],
+			rawText: text,
+			confidence: null,
+			source: "pdf-text",
+			order: detection.order
+		};
 	}
 
 	/* -------------------------------------------------------------- OCR driver */
@@ -1035,15 +1117,43 @@
 			})
 			.then(function (selection) {
 				var detections = selectionDetections(selection, image);
-				if (detections.length) geometrySource = "PDF selection";
-				return ocrPage(pageIndex, image, detections).then(function (message) {
-					if (!detections.length || (message.lines || []).some(function (line) {
-						return line.rawText && line.rawText.trim();
-					})) return message;
-					// An invisible or unrelated text layer can have selectable quads
-					// without visible ink. Retry with image detection in that case.
-					geometrySource = "PP-OCR detector";
-					return ocrPage(pageIndex, image, []);
+				if (!detections.length) return ocrPage(pageIndex, image, []);
+				var direct = [];
+				var remaining = [];
+				detections.forEach(function (detection) {
+					var extracted = extractedLatinLine(detection, image.sourceTextAnchors);
+					if (extracted) direct.push(extracted);
+					else remaining.push(detection);
+				});
+				geometrySource = direct.length
+					? (remaining.length ? "PDF text + selection" : "PDF text") : "PDF selection";
+				if (!remaining.length) return { lines: direct };
+				return ocrPage(pageIndex, image, remaining).then(function (message) {
+					var recognized = message.lines || [];
+					if (recognized.some(function (line) { return line.rawText && line.rawText.trim(); })) {
+						recognized.forEach(function (line) { line.source = "pdf-selection"; });
+						message.lines = direct.concat(recognized).sort(function (a, b) {
+							return a.order.line - b.order.line;
+						});
+						return message;
+					}
+					// An unrelated/invisible layer may have selectable boxes but no ink.
+					// Retry image detection, keeping the proven Latin source text.
+					geometrySource = direct.length ? "PDF text + PP-OCR detector" : "PP-OCR detector";
+					return ocrPage(pageIndex, image, []).then(function (fallback) {
+						fallback.lines = direct.concat((fallback.lines || []).filter(function (line) {
+							var rect = quadBounds(line.quad);
+							return !direct.some(function (original) {
+								var saved = quadBounds(original.quad);
+								var intersection = Math.max(0, Math.min(rect.right, saved.right) - Math.max(rect.left, saved.left)) *
+									Math.max(0, Math.min(rect.bottom, saved.bottom) - Math.max(rect.top, saved.top));
+								return intersection > (rect.right - rect.left) * (rect.bottom - rect.top) * 0.5;
+							});
+						})).sort(function (a, b) {
+							return quadBounds(a.quad).top - quadBounds(b.quad).top;
+						});
+						return fallback;
+					});
 				});
 			})
 			.then(function (message) {
@@ -1406,11 +1516,13 @@
 
 		var confidence = document.createElement("span");
 		confidence.className = "conf";
-		confidence.title = "Click to show the pixels the recognizer used";
+		confidence.title = line.source === "pdf-text"
+			? "Copied directly from the PDF text layer" : "Click to show the pixels the recognizer used";
 		var value = Number(line.confidence);
-		if (Number.isFinite(value) && value < REVIEW_CONFIDENCE) confidence.classList.add("low");
-		confidence.textContent = formatConfidence(line.confidence);
-		confidence.addEventListener("click", function () {
+		if (line.source !== "pdf-text" && Number.isFinite(value) && value < REVIEW_CONFIDENCE)
+			confidence.classList.add("low");
+		confidence.textContent = line.source === "pdf-text" ? "PDF text" : formatConfidence(line.confidence);
+		if (line.source !== "pdf-text") confidence.addEventListener("click", function () {
 			toggleLineCrop(page, line, row);
 		});
 
@@ -1586,7 +1698,8 @@
 					pageIndex: pageIndex,
 					unicode: unicode,
 					chunks: chunks,
-					quad: page.geometrySource === "PDF selection"
+					source: line.source,
+					quad: line.source === "pdf-selection" || line.source === "pdf-text"
 						? line.quad : pdfSemanticQuad(page, line.quad || line.alignmentQuad)
 				});
 			});
@@ -2079,7 +2192,7 @@
 	 * advanceTotal/1000 ems, and the horizontal vector is scaled by
 	 * (1000/advanceTotal) / quadHeight so the run spans exactly the quad width.
 	 */
-	function drawInvisibleLogicalLine(page, fontKey, encodedCids, sourceQuad, sourcePage, advanceTotal) {
+	function drawInvisibleLogicalLine(page, fontKey, encodedCids, sourceQuad, sourcePage, advanceTotal, source) {
 		var PDFLib = window.PDFLib;
 		var quad = {};
 		Object.keys(sourceQuad).forEach(function (name) {
@@ -2103,7 +2216,7 @@
 		var widthSize = total > 0 ? 1000 / total : 1;
 		// PDF selection geometry already has the correct height. Only detector
 		// boxes need growth to cover the ink above and below their crop.
-		var growth = sourcePage.geometrySource === "PDF selection" ? 1 : LOGICAL_BOX_GROWTH;
+		var growth = source === "pdf-selection" || source === "pdf-text" ? 1 : LOGICAL_BOX_GROWTH;
 		var heightSize = verticalLength > 0 ? verticalLength * growth : 1;
 		var widthScale = widthSize / heightSize;
 
@@ -2293,12 +2406,17 @@
 		});
 	}
 
-	function applyTextLayer(pdf) {
-		var units = buildLogicalUnits();
-		state.logicalUnitCount = units.length;
-		if (!units.length) {
+	function applyTextLayer(pdf, originalPreserved) {
+		var accepted = buildLogicalUnits();
+		if (!accepted.length) {
 			throw new Error("Nothing to export: every recognized line was rejected.");
 		}
+		// The original PDF already contains these verified Latin lines. Do not
+		// overlay a second selectable copy of them on top of the same ink.
+		var units = accepted.filter(function (unit) {
+			return !originalPreserved || unit.source !== "pdf-text";
+		});
+		state.logicalUnitCount = accepted.length;
 		// Give each page its own font. CID/GID indices start at one per page; this
 		// also bounds the font size for long documents without splitting a line.
 		return Promise.resolve().then(function () {
@@ -2315,7 +2433,7 @@
 				pageUnits.forEach(function (unit) {
 					drawInvisibleLogicalLine(
 						page, fontKey, logicalFont.cidsFor(unit.chunks), unit.quad,
-						state.pages[pageIndex], advanceTotalFor(unit.chunks)
+						state.pages[pageIndex], advanceTotalFor(unit.chunks), unit.source
 					);
 				});
 			});
@@ -2360,7 +2478,7 @@
 				});
 			})
 			.then(function () {
-				return applyTextLayer(pdf);
+				return applyTextLayer(pdf, usedOriginal);
 			})
 			.then(function () {
 				setProgress(0.85, "Saving…");
@@ -2496,6 +2614,7 @@
 		readSelectionGeometry: readSelectionGeometry,
 		ocrPage: ocrPage,
 		pdfTextAnchors: pdfTextAnchors,
-		sourceFontForLine: sourceFontForLine
+		sourceFontForLine: sourceFontForLine,
+		extractedLatinLine: extractedLatinLine
 	};
 })(window, undefined);
