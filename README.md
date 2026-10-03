@@ -12,7 +12,9 @@ OCR runs entirely on the user's machine. No document content is uploaded anywher
 - **Run OCR** on every page of the open PDF. On pages with selectable text, use
   the PDF editor's line-selection geometry to crop the visible text for OCR even
   when the embedded Khmer Unicode is broken. Pages without usable selection
-  geometry use the PP-OCRv6 detector.
+  geometry use the PP-OCRv6 detector. Scanned pages with a sparse, unreliable
+  selectable layer also use image detection; the panel explains when it ignores
+  that embedded text.
 - **Copy with Khmer OCR**: select text in the PDF editor and choose the action
   from its context menu while the plugin is open. Only the selected glyph
   regions are recognized, then their Khmer text is copied to the clipboard in

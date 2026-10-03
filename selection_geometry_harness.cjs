@@ -1,4 +1,4 @@
-// Run with node selection_geometry_harness.cjs [engine.js engine.wasm source.pdf [scanned.pdf [invitation.pdf [invitation.rgba]]]].
+// Run with node selection_geometry_harness.cjs [engine.js engine.wasm source.pdf [scanned.pdf [invitation.pdf [invitation.rgba [certificate.pdf certificate.rgba]]]]].
 // The optional PDF exercise uses the real editor selection-quad implementation.
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -235,7 +235,8 @@ async function checkParallelWorkers() {
 	console.log("Desktop worker pool, detection fallback, order and selector changes passed");
 }
 
-async function checkRealPdf(enginePath, wasmPath, pdfPath, scannedPath, invitationPath, rgbaPath) {
+async function checkRealPdf(enginePath, wasmPath, pdfPath, scannedPath, invitationPath, rgbaPath,
+	certificatePath, certificateRgbaPath) {
 	const wasm = fs.readFileSync(wasmPath);
 	let ready;
 	const loaded = new Promise(resolve => { ready = resolve; });
@@ -359,6 +360,10 @@ async function checkRealPdf(enginePath, wasmPath, pdfPath, scannedPath, invitati
 			const inkCrops = plugin.selectionDetections({ width: first.W, height: first.H, lines: fragments }, {
 				width, height, rgba: rgba.buffer.slice(rgba.byteOffset, rgba.byteOffset + rgba.byteLength)
 			});
+			const coverage = plugin.selectionInkCoverage(inkCrops, {
+				width, height, rgba: rgba.buffer.slice(rgba.byteOffset, rgba.byteOffset + rgba.byteLength)
+			});
+			assert(coverage > 0.4, "genuine selectable invitation lines cover most page ink");
 			const row = inkCrops.find(item => Math.abs(item.quad.p0.y / 2 - 288.4) < 3);
 			assert(row && row.cropQuad && row.quad.p1.x / width * first.W > 580 &&
 				row.cropQuad.p1.x / width * first.W < 560,
@@ -367,6 +372,27 @@ async function checkRealPdf(enginePath, wasmPath, pdfPath, scannedPath, invitati
 				`ink ${(row.cropQuad.p1.x / width * first.W).toFixed(1)}pt`);
 		}
 		invite.close();
+	}
+	if (certificatePath && certificateRgbaPath) {
+		const bytes = fs.readFileSync(certificatePath);
+		const certificate = editor.AscViewer.createFile(bytes.buffer.slice(bytes.byteOffset,
+			bytes.byteOffset + bytes.byteLength));
+		assert(certificate && certificate.pages.length === 1);
+		const page = certificate.pages[0];
+		page.text = certificate.getText(page.originIndex);
+		const fragments = certificate.copyPageTextWithQuads(0);
+		const raw = fs.readFileSync(certificateRgbaPath);
+		const height = page.H * 2;
+		const width = raw.length / (height * 4);
+		assert(Number.isInteger(width));
+		const image = { width, height,
+			rgba: raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength) };
+		const regions = plugin.selectionDetections({ width: page.W, height: page.H, lines: fragments }, image);
+		const coverage = plugin.selectionInkCoverage(regions, image);
+		console.log(`Lens certificate: ${fragments.length} phantom runs, ${(coverage * 100).toFixed(1)}% ink coverage`);
+		assert(regions.length > 0 && coverage < 0.4,
+			"garbled scanner text must trigger full-page image detection");
+		certificate.close();
 	}
 }
 
@@ -445,8 +471,8 @@ async function main() {
 	await checkLazyDetector();
 	await checkParallelWorkers();
 	if (process.argv.length > 2) {
-		assert(process.argv.length >= 5 && process.argv.length <= 8,
-			"provide engine.js engine.wasm source.pdf [scanned.pdf [invitation.pdf [invitation.rgba]]]");
+		assert(process.argv.length >= 5 && process.argv.length <= 10,
+			"provide engine.js engine.wasm source.pdf [scanned.pdf [invitation.pdf [invitation.rgba [certificate.pdf certificate.rgba]]]]");
 		await checkRealPdf(...process.argv.slice(2));
 	}
 	console.log("Selection-geometry bridge, crop alignment, and fallback passed");

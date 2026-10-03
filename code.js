@@ -18,7 +18,7 @@
 	// Bump whenever code.js changes, and keep it in step with the ?v= query in
 	// index.html/config.json. A stale WebView cache silently keeps the old build,
 	// so the running build is shown in the panel header.
-	var PLUGIN_BUILD = "pdf-selection-copy-23";
+	var PLUGIN_BUILD = "pdf-scan-fallback-24";
 	var COPY_SELECTION_MENU_ID = "khmer-ocr-copy-selection";
 	var PARALLELISM_KEY = "typsastra.khmer-ocr.parallel-workers";
 
@@ -106,6 +106,13 @@
 	function setStatus(text) {
 		state.status = text;
 		if (el.statusText) el.statusText.textContent = text;
+	}
+
+	function describeOcrError(error) {
+		var message = error && error.message ? error.message : String(error);
+		if (/does not support pdf input/i.test(message))
+			return "The OCR model reads rendered page images, not PDF files. This PDF could not be rendered as an image; check that it opens in the editor.";
+		return message;
 	}
 
 	function setProgress(fraction, text) {
@@ -949,6 +956,38 @@
 		return detections;
 	}
 
+	/**
+	 * A phone-scanned PDF may carry a tiny, nonsensical OCR text layer on top of
+	 * a full-page image. Its selectable quads are real but cover only a fraction
+	 * of the printed ink; using them skips most of the page. Count dark rendered
+	 * pixels inside the combined selection boxes versus the full page.
+	 */
+	function selectionInkCoverage(detections, image) {
+		if (!detections.length || !image.rgba ||
+			image.rgba.byteLength !== image.width * image.height * 4) return null;
+		var mask = new Uint8Array(image.width * image.height);
+		detections.forEach(function (detection) {
+			var box = quadBounds(detection.cropQuad || detection.quad);
+			var left = Math.max(0, Math.floor(box.left));
+			var right = Math.min(image.width, Math.ceil(box.right));
+			var top = Math.max(0, Math.floor(box.top));
+			var bottom = Math.min(image.height, Math.ceil(box.bottom));
+			for (var y = top; y < bottom; y++)
+				mask.fill(1, y * image.width + left, y * image.width + right);
+		});
+		var pixels = new Uint8ClampedArray(image.rgba);
+		var total = 0;
+		var covered = 0;
+		for (var i = 0; i < mask.length; i++) {
+			var offset = i * 4;
+			if (pixels[offset + 3] < 128 ||
+				Math.max(pixels[offset], pixels[offset + 1], pixels[offset + 2]) >= 185) continue;
+			total++;
+			if (mask[i]) covered++;
+		}
+		return total ? covered / total : 0;
+	}
+
 	/** Return the PDF's own text only when both its Unicode and font are credible. */
 	function extractedLatinLine(detection, anchors) {
 		var text = String(detection.sourceText || "").replace(/[\s\uFFFF]+/g, " ").trim();
@@ -1385,7 +1424,7 @@
 			})
 			.catch(function (error) {
 				console.error(error);
-				setStatus("OCR failed: " + (error && error.message ? error.message : String(error)));
+				setStatus("OCR failed: " + describeOcrError(error));
 				setProgress(null);
 			})
 			.then(function () {
@@ -1412,6 +1451,13 @@
 			.then(function (selection) {
 				var detections = selectionDetections(selection, image);
 				if (!detections.length) return ocrPage(pageIndex, image, []);
+				var inkCoverage = selectionInkCoverage(detections, image);
+				if (inkCoverage !== null && inkCoverage < 0.4) {
+					geometrySource = "PP-OCR detector (scanned page)";
+					setNotice("Page " + (pageIndex + 1) + " has an unreliable selectable text layer. OCR is detecting visible text from the scanned page image instead.");
+					setStatus("Page " + (pageIndex + 1) + ": embedded text misses most visible ink; detecting the scanned page instead.");
+					return ocrPage(pageIndex, image, []);
+				}
 				var direct = [];
 				var remaining = [];
 				detections.forEach(function (detection) {
@@ -2926,6 +2972,7 @@
 		save: savePlu,
 		clear: clearAll,
 		selectionDetections: selectionDetections,
+		selectionInkCoverage: selectionInkCoverage,
 		readSelectionGeometry: readSelectionGeometry,
 		ocrPage: ocrPage,
 		ensureWorker: ensureWorker,
