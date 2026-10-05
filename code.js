@@ -18,7 +18,7 @@
 	// Bump whenever code.js changes, and keep it in step with the ?v= query in
 	// index.html/config.json. A stale WebView cache silently keeps the old build,
 	// so the running build is shown in the panel header.
-	var PLUGIN_BUILD = "pdf-scan-fallback-24";
+	var PLUGIN_BUILD = "plu-selection-box-29";
 	var COPY_SELECTION_MENU_ID = "khmer-ocr-copy-selection";
 	var PARALLELISM_KEY = "typsastra.khmer-ocr.parallel-workers";
 
@@ -55,11 +55,14 @@
 	// height is derived from it.
 	var LOGICAL_ASCENT = 740;
 	var LOGICAL_DESCENT = 260;
-	// The detection quad is the recognizer's line box, which understates the ink.
-	// Growth is capped by the line pitch rather than by the ink: on a dense page
-	// the neighbouring boxes are only about 8pt apart, so a much larger factor
-	// would make one line's selection run into the next one's.
+	// Legacy fallback when a detector line has no explicit placement override.
 	var LOGICAL_BOX_GROWTH = 1.38;
+	// Growth for an OCR bounding box. quadForDetectorBox moves the origin 0.26 of
+	// the box height above the box bottom, so verticalLength spans the remaining
+	// 0.74 of the ascent; this factor turns that into a glyph box exactly one box
+	// height tall, which makes the reported selection coincide with the box the
+	// detector produced instead of sitting 0.169H below its centre.
+	var LOGICAL_ASCENT_GROWTH = 1000 / LOGICAL_ASCENT;
 
 	var PDF_RECONSTRUCTION_TOOL = "Typsastra Khmer Document Reconstruction";
 	var PDF_RECONSTRUCTION_URL = "https://ocr.typsastra.com/";
@@ -962,6 +965,34 @@
 	 * of the printed ink; using them skips most of the page. Count dark rendered
 	 * pixels inside the combined selection boxes versus the full page.
 	 */
+	/**
+	 * Place the invisible text origin inside an OCR line box.
+	 *
+	 * Both detector and PDF-selection geometry describe bounding rectangles,
+	 * not baselines. Keep their position and size rather than interpreting the
+	 * bottom edge as the text origin.
+	 *
+	 * The writer anchors the origin at quad.p3 and derives a glyph box of height
+	 * S spanning 0.74S above it and 0.26S below. Anchoring at the box bottom and
+	 * growing by LOGICAL_BOX_GROWTH therefore drops the reported selection below
+	 * the box centre.
+	 *
+	 * To make the reported glyph box equal the detector box, the origin has to
+	 * sit 0.26H above the box bottom, leaving verticalLength spanning 0.74H of
+	 * the ascent. The growth paired with that is 1000/740.
+	 */
+	function quadForDetectorBox(quad) {
+		if (!(Math.hypot(quad.p0.x - quad.p3.x, quad.p0.y - quad.p3.y) > 0)) return quad;
+		return {
+			p0: { x: quad.p0.x, y: quad.p0.y },
+			p1: { x: quad.p1.x, y: quad.p1.y },
+			p2: { x: quad.p2.x + 0.26 * (quad.p1.x - quad.p2.x),
+				y: quad.p2.y + 0.26 * (quad.p1.y - quad.p2.y) },
+			p3: { x: quad.p3.x + 0.26 * (quad.p0.x - quad.p3.x),
+				y: quad.p3.y + 0.26 * (quad.p0.y - quad.p3.y) }
+		};
+	}
+
 	function selectionInkCoverage(detections, image) {
 		if (!detections.length || !image.rgba ||
 			image.rgba.byteLength !== image.width * image.height * 4) return null;
@@ -2033,18 +2064,34 @@
 				if (/[\u1780-\u17ff]/.test(unicode)) {
 					state.widthStats[shapedWidths ? "shaped" : "fallback"]++;
 				}
+				var placement = pluPlacement(page, line);
 				units.push({
 					id: lineId++,
 					pageIndex: pageIndex,
 					unicode: unicode,
 					chunks: chunks,
 					source: line.source,
-					quad: line.source === "pdf-selection" || line.source === "pdf-text"
-						? line.quad : pdfSemanticQuad(page, line.quad || line.alignmentQuad)
+					quad: placement ? placement.quad : null,
+					growth: placement ? placement.growth : null
 				});
 			});
 		});
 		return units;
+	}
+
+	/**
+	 * Decide the quad a line is written with in the PLU, plus the glyph box
+	 * growth that quad needs. A preserved PDF-text line already has its original
+	 * layer and is used unchanged. Detector and PDF-selection quads both describe
+	 * bounding rectangles, not baselines: move the origin inside the box so the
+	 * emitted glyph bounds coincide with the rectangle used for recognition.
+	 */
+	function pluPlacement(page, line) {
+		var base = line.quad || line.alignmentQuad;
+		if (!base) return null;
+		if (line.source === "pdf-text")
+			return { quad: base, growth: null };
+		return { quad: quadForDetectorBox(base), growth: LOGICAL_ASCENT_GROWTH };
 	}
 
 	/**
@@ -2532,7 +2579,7 @@
 	 * advanceTotal/1000 ems, and the horizontal vector is scaled by
 	 * (1000/advanceTotal) / quadHeight so the run spans exactly the quad width.
 	 */
-	function drawInvisibleLogicalLine(page, fontKey, encodedCids, sourceQuad, sourcePage, advanceTotal, source) {
+	function drawInvisibleLogicalLine(page, fontKey, encodedCids, sourceQuad, sourcePage, advanceTotal, source, growthOverride) {
 		var PDFLib = window.PDFLib;
 		var quad = {};
 		Object.keys(sourceQuad).forEach(function (name) {
@@ -2554,9 +2601,10 @@
 		// size, or one of them would be wrong: the font size can only satisfy one.
 		var total = Number(advanceTotal);
 		var widthSize = total > 0 ? 1000 / total : 1;
-		// PDF selection geometry already has the correct height. Only detector
-		// boxes need growth to cover the ink above and below their crop.
-		var growth = source === "pdf-selection" || source === "pdf-text" ? 1 : LOGICAL_BOX_GROWTH;
+		// Bounding-box placements explicitly supply their own growth; preserved
+		// PDF text and the legacy detector fallback retain their original values.
+		var growth = Number.isFinite(growthOverride) ? growthOverride
+			: (source === "pdf-selection" || source === "pdf-text" ? 1 : LOGICAL_BOX_GROWTH);
 		var heightSize = verticalLength > 0 ? verticalLength * growth : 1;
 		var widthScale = widthSize / heightSize;
 
@@ -2773,7 +2821,7 @@
 				pageUnits.forEach(function (unit) {
 					drawInvisibleLogicalLine(
 						page, fontKey, logicalFont.cidsFor(unit.chunks), unit.quad,
-						state.pages[pageIndex], advanceTotalFor(unit.chunks), unit.source
+						state.pages[pageIndex], advanceTotalFor(unit.chunks), unit.source, unit.growth
 					);
 				});
 			});
@@ -2973,6 +3021,9 @@
 		clear: clearAll,
 		selectionDetections: selectionDetections,
 		selectionInkCoverage: selectionInkCoverage,
+		quadForDetectorBox: quadForDetectorBox,
+		detectorBoxGrowth: LOGICAL_ASCENT_GROWTH,
+		pluPlacement: pluPlacement,
 		readSelectionGeometry: readSelectionGeometry,
 		ocrPage: ocrPage,
 		ensureWorker: ensureWorker,
