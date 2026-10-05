@@ -140,4 +140,27 @@ function quad() {
 		addedRuns === 0 && plugin.state.logicalUnitCount === 1);
 	await plugin.applyTextLayer(latinPdf, false);
 	check("Latin is embedded when only a raster export is available", addedRuns > 0);
+
+	// Preserving the original PDF must not let its legacy selectable text win
+	// hit-testing over the invisible OCR layer. Keep the source content, but
+	// write the OCR stream first in the page's Contents array.
+	const vectorPdf = await PDFLib.PDFDocument.create();
+	const vectorPage = vectorPdf.addPage([595, 842]);
+	vectorPage.drawText("Visible vector text", { x: 50, y: 600 });
+	const preservedPdf = await PDFLib.PDFDocument.load(await vectorPdf.save());
+	plugin.state.pages = [{ index: 0, width: 595, height: 842, pdfWidth: 595, pdfHeight: 842,
+		sourceTextAnchors: [], lines: [{ status: "accepted", source: "pdf-selection",
+			rawText: "សទ្ទា", units: [
+				{ rawText: "ស", timestepStart: 0, timestepEnd: 1 },
+				{ rawText: "ទ្ទា", timestepStart: 1, timestepEnd: 3 }
+			], quad: quad() }] }];
+	await plugin.applyTextLayer(preservedPdf, true);
+	const savedPdf = await PDFLib.PDFDocument.load(await preservedPdf.save());
+	const page = savedPdf.getPage(0);
+	const contents = page.node.Contents();
+	const firstContent = Buffer.from(PDFLib.decodePDFRawStream(savedPdf.context.lookup(contents.get(0))).decode()).toString();
+	const streams = Array.from({ length: contents.size() }, (_, i) =>
+		Buffer.from(PDFLib.decodePDFRawStream(savedPdf.context.lookup(contents.get(i))).decode()).toString());
+	check("OCR stream precedes preserved original text", firstContent.includes("3 Tr") &&
+		streams.slice(1).some((stream) => stream.includes("/Helvetica-") && stream.includes(" Tj")));
 })().catch((error) => { console.error(error); process.exitCode = 1; });

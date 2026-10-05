@@ -18,7 +18,7 @@
 	// Bump whenever code.js changes, and keep it in step with the ?v= query in
 	// index.html/config.json. A stale WebView cache silently keeps the old build,
 	// so the running build is shown in the panel header.
-	var PLUGIN_BUILD = "plu-selection-box-29";
+	var PLUGIN_BUILD = "plu-ocr-priority-31";
 	var COPY_SELECTION_MENU_ID = "khmer-ocr-copy-selection";
 	var PARALLELISM_KEY = "typsastra.khmer-ocr.parallel-workers";
 
@@ -2824,6 +2824,19 @@
 						state.pages[pageIndex], advanceTotalFor(unit.chunks), unit.source, unit.growth
 					);
 				});
+				if (originalPreserved) {
+					// The preserved PDF can contain a legacy Khmer text layer with a
+					// broken Unicode mapping. If that layer comes first, PDFium's
+					// hit-testing can return its garbled text instead of our OCR text
+					// at the same coordinates. Put the newly written, invisible OCR
+					// stream first; the original streams still paint the crisp page.
+					var contents = page.node.Contents();
+					if (contents instanceof window.PDFLib.PDFArray && contents.size() > 1) {
+						var overlay = contents.get(contents.size() - 1);
+						contents.remove(contents.size() - 1);
+						contents.insert(0, overlay);
+					}
+				}
 			});
 			setMetadata(pdf);
 			return pdf;
@@ -2847,6 +2860,12 @@
 		var usedOriginal = false;
 
 		readOriginalPdfBytes()
+			.then(function (result) {
+				if (result.bytes) return result.bytes;
+				return desktopOriginalBytes().then(function (bytes) {
+					return bytes || webOriginalBytes();
+				});
+			})
 			.then(function (bytes) {
 				if (!bytes) return null;
 				setStatus("Adding text layer to the original PDF…");
@@ -2860,6 +2879,7 @@
 					usedOriginal = true;
 					return pdf;
 				}
+				setNotice("Original PDF unavailable; exporting rendered page images instead (reduced quality).");
 				return buildRasterPdf(PDFLib).then(function (created) {
 					pdf = created;
 					return pdf;
@@ -2876,7 +2896,7 @@
 				saveBlob(bytes, documentName() + "-PLU.pdf");
 				setProgress(1, "PLU PDF ready");
 				setStatus("PLU PDF created: " + state.logicalUnitCount + " line(s)" +
-					(usedOriginal ? ", original page quality kept" : "") +
+					(usedOriginal ? ", original page quality kept" : ", rendered-page quality only") +
 					(state.widthStats && state.widthStats.shaped ?
 						", matched-font widths on " + state.widthStats.shaped + " Khmer line(s)" +
 						(state.widthStats.fallback ? ", OCR timing on " +
