@@ -18,7 +18,7 @@
 	// Bump whenever code.js changes, and keep it in step with the ?v= query in
 	// index.html/config.json. A stale WebView cache silently keeps the old build,
 	// so the running build is shown in the panel header.
-	var PLUGIN_BUILD = "plu-ocr-priority-31";
+	var PLUGIN_BUILD = "plu-no-export-32";
 	var COPY_SELECTION_MENU_ID = "khmer-ocr-copy-selection";
 	var PARALLELISM_KEY = "typsastra.khmer-ocr.parallel-workers";
 
