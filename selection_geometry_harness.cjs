@@ -94,6 +94,17 @@ function checkLatinSourceRestoration() {
 		fontSourceName:"UnlistedKhmerSubset", bounds:{left:0,right:100,top:0,bottom:12} }]);
 	assert.equal(titleExtraction.rawText, titleSource,
 		"matching native source text and geometry should preserve ordinary Latin without a font list");
+	const khmerCrop = { p0:{x:0,y:0}, p1:{x:100,y:0}, p2:{x:100,y:12}, p3:{x:0,y:12} };
+	const subtitleLeak = { rawText:"LEXICON DGITAL TERMOLOGY",
+		units:[{rawText:"LEXICON DGITAL TERMOLOGY",timestepStart:0,timestepEnd:100}],
+		alignmentQuad:khmerCrop, ctcContentLength:100 };
+	plugin.restoreSourceLatin(subtitleLeak, { quad:khmerCrop, cropQuad:khmerCrop }, [{
+		corruptText:titleSource, fontSourceName:"UnknownSubset",
+		baselineStart:{x:0,y:10}, baselineEnd:{x:100,y:10},
+		bounds:{left:0,right:100,top:10,bottom:24}
+	}]);
+	assert.equal(subtitleLeak.rawText, "LEXICON DGITAL TERMOLOGY",
+		"a neighboring subtitle with only a sliver of vertical overlap must not replace the Khmer crop");
 	const legacyFont = [{ corruptText: "kmμiksmaCik", fontSourceName: "KhmerOS",
 		bounds: { left: 42, right: 100, top: 0, bottom: 20 } }];
 	const untouched = { units, rawText: units.map(unit => unit.rawText).join(""),
@@ -124,10 +135,37 @@ function checkInkGapCropSeparation() {
 	assert(detections[0].cropQuad && detections[1].cropQuad);
 	assert(detections[0].cropQuad.p2.y <= detections[1].cropQuad.p0.y,
 		"use the rendered blank row to split overlapping selection boxes");
+	const singleWidth = 40, singleHeight = 50;
+	const singleRgba = new Uint8ClampedArray(singleWidth * singleHeight * 4);
+	singleRgba.fill(255);
+	for (let y = 16; y < 35; y++) for (let x = 6; x < 35; x++) {
+		const offset = (y * singleWidth + x) * 4;
+		singleRgba[offset] = singleRgba[offset + 1] = singleRgba[offset + 2] = 0;
+	}
+	const selectedLine = plugin.selectionDetections({ width:singleWidth, height:singleHeight, lines:[
+		{text:"selected glyph line",quads:[5,20,35,20,5,30,35,30]}
+	]}, {width:singleWidth,height:singleHeight,rgba:singleRgba.buffer})[0];
+	assert(selectedLine.cropQuad.p0.y <= 15 && selectedLine.cropQuad.p3.y >= 35,
+		"expand a selected-line crop to include visible ink outside the editor's text bbox");
 	console.log("Ink-gap separation for overlapping text boxes passed");
 }
 
 checkInkGapCropSeparation();
+
+function checkSevereBoxOverlapFallback() {
+	const boxes = [
+		{ p0:{x:0,y:100}, p1:{x:100,y:100}, p2:{x:100,y:135}, p3:{x:0,y:135} },
+		{ p0:{x:5,y:118}, p1:{x:95,y:118}, p2:{x:95,y:137}, p3:{x:5,y:137} }
+	];
+	assert(plugin.hasSevereTextBoxOverlap(boxes.map(quad => ({ quad }))),
+		"overlapping source text lines should select image-based page detection");
+	assert.equal(plugin.hasSevereTextBoxOverlap([
+		{ quad:boxes[0] }, { quad:{ p0:{x:0,y:145}, p1:{x:100,y:145}, p2:{x:100,y:160}, p3:{x:0,y:160} } }
+	]), false, "separate source line boxes continue using their text geometry");
+	console.log("Severe source-box overlap detection passed");
+}
+
+checkSevereBoxOverlapFallback();
 
 async function checkFullPageLatinRestoration() {
 	const source = fs.readFileSync(path.join(__dirname, "code.js"), "utf8");
@@ -169,6 +207,31 @@ async function checkFullPageLatinRestoration() {
 			return processPage(0,0,1,{kind:'pdfjs',render:function(){ return Promise.resolve(image); }})
 				.then(function(){ return state.pages[0].lines.map(function(line){return line.rawText;}).join(''); });
 		};
+		window.runOverlapFallbackProbe = function() {
+			state.pages = [];
+			var calls = [];
+			var boxes = [
+				{p0:{x:0,y:100},p1:{x:100,y:100},p2:{x:100,y:135},p3:{x:0,y:135}},
+				{p0:{x:5,y:118},p1:{x:95,y:118},p2:{x:95,y:137},p3:{x:5,y:137}}
+			];
+			var regions = boxes.map(function(quad,index) { return {id:index,quad:quad,
+				sourceText:index ? 'English subtitle' : 'Khmer source line'}; });
+			setPageProgress = function() {};
+			setStatus = function() {};
+			renderPages = function() {};
+			readSelectionGeometry = function() { return Promise.resolve({}); };
+			selectionDetections = function() { return regions; };
+			selectionInkCoverage = function() { return 1; };
+			extractedLatinLine = function() { return null; };
+			ocrPage = function(index,image,detections) {
+				calls.push(detections.length);
+				return Promise.resolve({lines:[{rawText:'image-recognized lines',quad:boxes[0],units:[]} ]});
+			};
+			var image = {width:100,height:150,dataUrl:'data:image/png;base64,AA==',
+				pdfWidth:100,pdfHeight:150,sourceTextAnchors:[],isPlu:false};
+			return processPage(0,0,1,{kind:'pdfjs',render:function(){return Promise.resolve(image);}})
+				.then(function(){return {calls:calls,geometry:state.pages[0].geometrySource};});
+		};
 	`;
 	const probeWindow = { Asc: { plugin: {} } };
 	const sandbox = { window: probeWindow, console, Promise, setTimeout, clearTimeout,
@@ -191,6 +254,10 @@ async function checkFullPageLatinRestoration() {
 		fontSourceName:"UnlistedEmbeddedFont", bounds:{left:10,right:90,top:10,bottom:15},
 		baselineStart:{x:10,y:15}, baselineEnd:{x:90,y:15}, quad:tinyUrlQuad }), tinyUrl,
 		"small structured Latin source text must be included even when the OCR detector misses it");
+	const overlapFallback = await probeWindow.runOverlapFallbackProbe();
+	assert.deepEqual(Array.from(overlapFallback.calls), [0],
+		"full-page OCR should use image detection rather than overlapping source boxes");
+	assert.match(overlapFallback.geometry, /overlapping source boxes/);
 	console.log("Full-page mixed Khmer/Latin OCR restoration passed");
 }
 
