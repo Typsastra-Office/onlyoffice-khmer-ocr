@@ -146,7 +146,26 @@ function checkInkGapCropSeparation() {
 		{text:"selected glyph line",quads:[5,20,35,20,5,30,35,30]}
 	]}, {width:singleWidth,height:singleHeight,rgba:singleRgba.buffer})[0];
 	assert(selectedLine.cropQuad.p0.y <= 15 && selectedLine.cropQuad.p3.y >= 35,
-		"expand a selected-line crop to include visible ink outside the editor's text bbox");
+		"full-page OCR can expand a source box to visible ink");
+	const manualLine = plugin.selectedDetections({width:singleWidth,height:singleHeight,
+		quads:[[5,20,35,20,5,30,35,30]]},
+		{width:singleWidth,height:singleHeight,rgba:singleRgba.buffer})[0];
+	const manualCrop = manualLine.cropQuad || manualLine.quad;
+	assert.equal(manualCrop.p0.y, 20);
+	assert.equal(manualCrop.p3.y, 30,
+		"manual selection must not include neighboring ink above or below its selected row");
+	const pageLines = [
+		{text:"preceding line",quads:[5,8,35,8,5,22,35,22]},
+		{text:"selected line",quads:[5,20,35,20,5,30,35,30]},
+		{text:"next line",quads:[5,25,35,25,5,38,35,38]}
+	];
+	plugin.attachSourceTextToRegions([manualLine], {width:singleWidth,height:singleHeight,lines:pageLines},
+		{width:singleWidth,height:singleHeight,rgba:singleRgba.buffer});
+	const pageCrop = plugin.selectionDetections({width:singleWidth,height:singleHeight,lines:pageLines},
+		{width:singleWidth,height:singleHeight,rgba:singleRgba.buffer})[1].cropQuad;
+	assert.equal(manualLine.sourceText, "selected line");
+	assert.equal(manualLine.cropQuad.p3.y, Math.min(30, pageCrop.p3.y),
+		"manual OCR should use the matching page line's neighbor-aware vertical bound");
 	console.log("Ink-gap separation for overlapping text boxes passed");
 }
 

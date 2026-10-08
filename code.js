@@ -18,7 +18,7 @@
 	// Bump whenever code.js changes, and keep it in step with the ?v= query in
 	// index.html/config.json. A stale WebView cache silently keeps the old build,
 	// so the running build is shown in the panel header.
-	var PLUGIN_BUILD = "source-script-47";
+	var PLUGIN_BUILD = "selection-crop-48";
 	var COPY_SELECTION_MENU_ID = "khmer-ocr-copy-selection";
 	var PARALLELISM_KEY = "typsastra.khmer-ocr.parallel-workers";
 
@@ -376,7 +376,7 @@
 		return selectionDetections({ width: selection.width, height: selection.height,
 			rotation: selection.rotation, lines: selection.quads.map(function (quad) {
 				return { text: "ក", quads: quad };
-			}) }, image).sort(function (a, b) {
+			}) }, image, true).sort(function (a, b) {
 			return quadBounds(a.quad).top - quadBounds(b.quad).top ||
 			quadBounds(a.quad).left - quadBounds(b.quad).left;
 		});
@@ -408,7 +408,25 @@
 					bestOverlap = ratio;
 				}
 			});
-			if (best && bestOverlap >= 0.35) region.sourceText = best.sourceText;
+			if (best && bestOverlap >= 0.35) {
+				region.sourceText = best.sourceText;
+				// Preserve the user's horizontal selection, but use the page line's
+				// neighbor-aware vertical crop so the recognizer cannot read the
+				// following line through its built-in crop padding.
+				if (best.cropQuad && Math.abs(bounds.top - quadBounds(best.quad).top) <
+					Math.max(3, bounds.bottom - bounds.top) * 0.25) {
+					var selected = quadBounds(region.cropQuad || region.quad);
+					var sourceCrop = quadBounds(best.cropQuad);
+					var top = Math.max(selected.top, sourceCrop.top);
+					var bottom = Math.min(selected.bottom, sourceCrop.bottom);
+					if (bottom - top >= (selected.bottom - selected.top) * 0.4) {
+						region.cropQuad = {
+							p0: { x: selected.left, y: top }, p1: { x: selected.right, y: top },
+							p2: { x: selected.right, y: bottom }, p3: { x: selected.left, y: bottom }
+						};
+					}
+				}
+			}
 		});
 		return regions;
 	}
@@ -835,7 +853,7 @@
 	 * The extracted text is retained for reliable Latin lines; legacy Khmer
 	 * encodings still need recognition from the page image.
 	 */
-	function selectionDetections(selection, image) {
+	function selectionDetections(selection, image, isSelectedRegion) {
 		if (!selection || !Array.isArray(selection.lines) || !image ||
 			(selection.rotation && selection.rotation % 360 !== 0) ||
 			!Number.isFinite(selection.width) || !Number.isFinite(selection.height) ||
@@ -861,7 +879,8 @@
 			detections.push({ id: detections.length, quad: quad, sourceText: line.text, score: 1,
 				order: { region: 0, line: detections.length, position: 0 } });
 		});
-		return constrainSelectionInk(constrainSelectionCrops(mergeSelectionFragments(detections), image), image);
+		return constrainSelectionInk(constrainSelectionCrops(mergeSelectionFragments(detections), image), image,
+			!isSelectedRegion);
 	}
 
 	// Native PDF extraction can split one visual Khmer line into overlapping
@@ -985,13 +1004,16 @@
 	// The editor selects that advance, so trimming to the rendered ink is needed
 	// after merging fragments. Work inside the vertically bounded crop, and keep
 	// a couple of pixels for antialiasing and Khmer marks.
-	function constrainSelectionInk(detections, image) {
+	function constrainSelectionInk(detections, image, expandVerticalInk) {
 		if (!image.rgba || image.rgba.byteLength !== image.width * image.height * 4) return detections;
 		var pixels = new Uint8ClampedArray(image.rgba);
 		detections.forEach(function (detection) {
 			var originalBox = quadBounds(detection.cropQuad || detection.quad);
 			var box = originalBox;
-			if (!detection.cropQuad) box = expandSelectionBoxToInk(detection, detections, image, pixels, box);
+			// A manual selection already specifies the intended row. Searching beyond
+			// it without the other page lines pulls ink from adjacent paragraphs.
+			if (expandVerticalInk && !detection.cropQuad)
+				box = expandSelectionBoxToInk(detection, detections, image, pixels, box);
 			if (box.top < originalBox.top || box.bottom > originalBox.bottom) {
 				detection.cropQuad = {
 					p0: { x: box.left, y: box.top }, p1: { x: box.right, y: box.top },
@@ -3495,6 +3517,7 @@
 		readWorkerPreference: readWorkerPreference,
 		saveWorkerPreference: saveWorkerPreference,
 		selectedDetections: selectedDetections,
+		attachSourceTextToRegions: attachSourceTextToRegions,
 		readSelectedQuads: readSelectedQuads,
 		copyRecognizedSelection: copyRecognizedSelection,
 		copySelectionWithOcr: copySelectionWithOcr,
