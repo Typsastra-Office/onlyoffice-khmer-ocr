@@ -18,13 +18,20 @@ OCR runs entirely on the user's machine. No document content is uploaded anywher
 - **Copy with Khmer OCR**: select text in the PDF editor and choose the action
   from its context menu while the plugin is open. Only the selected glyph
   regions are recognized, then their Khmer text is copied to the clipboard in
-  page and line order. The editor snapshots the quads when its menu opens and
-  handles the clipboard write after OCR. Requires the Typsastra PDF editor menu
-  integration.
-- **Preserve readable Latin text**: when a selectable line contains valid Latin
-  Unicode from a Latin PDF font, take its text directly instead of re-running
-  OCR. Legacy Khmer fonts still use image recognition. Adjacent selection boxes
-  are bounded at the midpoint between lines before cropping for OCR. Font or
+  page and line order. Trustworthy Latin runs are restored from the PDF's text
+  layer so email addresses, URLs and other mixed-script content retain their
+  source spelling and case. The editor snapshots the quads when its menu opens
+  and handles the clipboard write after OCR. Requires the Typsastra PDF editor
+  menu integration.
+- **Preserve readable Latin text**: extract source Latin directly when the PDF's
+  text layer and its independent text anchors agree geometrically, regardless
+  of embedded font name. In mixed Khmer/Latin lines, use the PDF line's Unicode
+  text as evidence and restore source Latin runs by glyph position after OCR;
+  this applies both to full-page recognition and manual selection copying.
+  Khmer text is always image-recognized unless the PDF carries this plugin's
+  verified PLU provenance. If adjacent source text boxes overlap, use the
+  rendered ink gap to separate their OCR crops. Adjacent
+  selection boxes are bounded at the midpoint between lines before cropping for OCR. Font or
   shaping changes that split a visual line into overlapping PDF text runs are
   grouped by their shared baseline for one recognition crop. When the PDF font
   reports a wider box than the actual text, the visible ink bounds the crop and
