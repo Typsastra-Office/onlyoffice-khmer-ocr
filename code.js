@@ -18,7 +18,7 @@
 	// Bump whenever code.js changes, and keep it in step with the ?v= query in
 	// index.html/config.json. A stale WebView cache silently keeps the old build,
 	// so the running build is shown in the panel header.
-	var PLUGIN_BUILD = "source-script-44";
+	var PLUGIN_BUILD = "source-script-47";
 	var COPY_SELECTION_MENU_ID = "khmer-ocr-copy-selection";
 	var PARALLELISM_KEY = "typsastra.khmer-ocr.parallel-workers";
 
@@ -387,16 +387,22 @@
 		regions.forEach(function (region) {
 			var bounds = quadBounds(region.quad);
 			var area = Math.max(1, (bounds.right - bounds.left) * (bounds.bottom - bounds.top));
+			var centerY = (bounds.top + bounds.bottom) / 2;
 			var best = null;
 			var bestOverlap = 0;
 			sourceLines.forEach(function (sourceLine) {
 				var sourceBounds = quadBounds(sourceLine.quad);
+				var sourceHeight = sourceBounds.bottom - sourceBounds.top;
+				var overlapY = Math.max(0, Math.min(bounds.bottom, sourceBounds.bottom) -
+					Math.max(bounds.top, sourceBounds.top));
+				if (overlapY < Math.min(bounds.bottom - bounds.top, sourceHeight) * 0.5) return;
 				var overlap = Math.max(0, Math.min(bounds.right, sourceBounds.right) -
 					Math.max(bounds.left, sourceBounds.left)) *
-					Math.max(0, Math.min(bounds.bottom, sourceBounds.bottom) -
-					Math.max(bounds.top, sourceBounds.top));
+					overlapY;
 				var ratio = overlap / Math.min(area, Math.max(1,
 					(sourceBounds.right - sourceBounds.left) * (sourceBounds.bottom - sourceBounds.top)));
+				ratio -= Math.abs(centerY - (sourceBounds.top + sourceBounds.bottom) / 2) /
+					Math.max(1, Math.min(bounds.bottom - bounds.top, sourceHeight)) * 0.15;
 				if (ratio > bestOverlap && sourceLine.sourceText) {
 					best = sourceLine;
 					bestOverlap = ratio;
@@ -983,7 +989,15 @@
 		if (!image.rgba || image.rgba.byteLength !== image.width * image.height * 4) return detections;
 		var pixels = new Uint8ClampedArray(image.rgba);
 		detections.forEach(function (detection) {
-			var box = quadBounds(detection.cropQuad || detection.quad);
+			var originalBox = quadBounds(detection.cropQuad || detection.quad);
+			var box = originalBox;
+			if (!detection.cropQuad) box = expandSelectionBoxToInk(detection, detections, image, pixels, box);
+			if (box.top < originalBox.top || box.bottom > originalBox.bottom) {
+				detection.cropQuad = {
+					p0: { x: box.left, y: box.top }, p1: { x: box.right, y: box.top },
+					p2: { x: box.right, y: box.bottom }, p3: { x: box.left, y: box.bottom }
+				};
+			}
 			var height = box.bottom - box.top;
 			var width = box.right - box.left;
 			if (height < 5 || width < 8 ||
@@ -1019,6 +1033,48 @@
 			};
 		});
 		return detections;
+	}
+
+	function expandSelectionBoxToInk(detection, detections, image, pixels, box) {
+		var line = quadBounds(detection.quad);
+		var lineHeight = line.bottom - line.top;
+		var width = line.right - line.left;
+		if (lineHeight < 5 || width < 8) return box;
+		var center = (line.top + line.bottom) / 2;
+		var growth = Math.min(48, Math.max(3, lineHeight * 0.65));
+		var searchTop = Math.max(0, line.top - growth);
+		var searchBottom = Math.min(image.height, line.bottom + growth);
+		detections.forEach(function (other) {
+			if (other === detection) return;
+			var neighbor = quadBounds(other.quad);
+			var overlap = Math.max(0, Math.min(line.right, neighbor.right) - Math.max(line.left, neighbor.left));
+			if (overlap < Math.min(width, neighbor.right - neighbor.left) * 0.35) return;
+			var neighborCenter = (neighbor.top + neighbor.bottom) / 2;
+			var divider = (center + neighborCenter) / 2;
+			if (neighborCenter < center) searchTop = Math.max(searchTop, divider);
+			else if (neighborCenter > center) searchBottom = Math.min(searchBottom, divider);
+		});
+		var x0 = Math.max(0, Math.ceil(line.left));
+		var x1 = Math.min(image.width - 1, Math.floor(line.right));
+		var minInk = Math.max(1, Math.floor((x1 - x0 + 1) * 0.003));
+		var first = Infinity;
+		var last = -Infinity;
+		for (var y = Math.floor(searchTop); y < Math.ceil(searchBottom); y++) {
+			var count = 0;
+			for (var x = x0; x <= x1; x++) {
+				var offset = (y * image.width + x) * 4;
+				if (pixels[offset + 3] >= 128 &&
+					Math.max(pixels[offset], pixels[offset + 1], pixels[offset + 2]) < 170) count++;
+			}
+			if (count >= minInk) { first = Math.min(first, y); last = y; }
+		}
+		if (!Number.isFinite(first) || !Number.isFinite(last)) return box;
+		return {
+			left: box.left,
+			right: box.right,
+			top: Math.min(box.top, first - 1),
+			bottom: Math.max(box.bottom, last + 2)
+		};
 	}
 
 	/**
@@ -1081,6 +1137,24 @@
 		return total ? covered / total : 0;
 	}
 
+	function hasSevereTextBoxOverlap(detections) {
+		for (var i = 0; i < detections.length; i++) {
+			var a = quadBounds(detections[i].quad);
+			var heightA = a.bottom - a.top;
+			var widthA = a.right - a.left;
+			for (var j = i + 1; j < detections.length; j++) {
+				var b = quadBounds(detections[j].quad);
+				var heightB = b.bottom - b.top;
+				var widthB = b.right - b.left;
+				var overlapX = Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left));
+				var overlapY = Math.max(0, Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top));
+				if (overlapX / Math.max(1, Math.min(widthA, widthB)) >= 0.5 &&
+					overlapY / Math.max(1, Math.min(heightA, heightB)) >= 0.25) return true;
+			}
+		}
+		return false;
+	}
+
 	/** Return Latin PDF text when an independent text anchor agrees geometrically. */
 	function extractedLatinLine(detection, anchors) {
 		var text = String(detection.sourceText || "").replace(/[\s\uFFFF]+/g, " ").trim();
@@ -1116,12 +1190,6 @@
 		text = String(text || "");
 		return /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(text) ||
 			/(?:https?:\/\/|www\.)[A-Z0-9.-]+\.[A-Z]{2,}(?:[/?#][A-Z0-9._~:/?#[\]@!$&'()*+,;=%-]*)?/i.test(text);
-	}
-
-	function hasMixedUnicode(text) {
-		text = String(text || "");
-		return /[\u1780-\u17FF]/.test(text) && /[A-Za-z]/.test(text) &&
-			/^[\u0020-\u007E\u1780-\u17FF\u00A0\u00AD\u200B-\u200F\u2010-\u201F\u2026\u20AC]*$/.test(text);
 	}
 
 	function isPluPdfMetadata(info) {
@@ -1192,7 +1260,10 @@
 				Math.max(bounds.left, anchor.bounds.left));
 			var overlapY = Math.max(0, Math.min(bounds.bottom, anchor.bounds.bottom) -
 				Math.max(bounds.top, anchor.bounds.top));
-			if (overlapY <= 0 || overlapX < Math.min(anchor.bounds.right - anchor.bounds.left,
+			var anchorHeight = anchor.bounds.bottom - anchor.bounds.top;
+			var cropHeight = bounds.bottom - bounds.top;
+			if (overlapY < anchorHeight * 0.45 || overlapY < cropHeight * 0.25 ||
+				overlapX < Math.min(anchor.bounds.right - anchor.bounds.left,
 				bounds.right - bounds.left) * 0.65) return;
 			var baselineStart = anchor.baselineStart || {
 				x: anchor.bounds.left, y: (anchor.bounds.top + anchor.bounds.bottom) / 2
@@ -1801,6 +1872,20 @@
 					setNotice("Page " + (pageIndex + 1) + " has an unreliable selectable text layer. OCR is detecting visible text from the scanned page image instead.");
 					setStatus("Page " + (pageIndex + 1) + ": embedded text misses most visible ink; detecting the scanned page instead.");
 					return ocrPage(pageIndex, image, []);
+				}
+				if (hasSevereTextBoxOverlap(detections)) {
+					geometrySource = "PP-OCR detector (overlapping source boxes)";
+					setNotice("Page " + (pageIndex + 1) + " has overlapping selectable text boxes. OCR is detecting visible text from the page image instead.");
+					setStatus("Page " + (pageIndex + 1) + ": source text boxes overlap; detecting visible lines from the page image.");
+					return ocrPage(pageIndex, image, []).then(function (message) {
+						(message.lines || []).forEach(function (line) {
+							restoreSourceLatin(line, null, image.sourceTextAnchors);
+							restoreNativeKhmerWhenOcrChangesScript(line, null, image.isPlu);
+						});
+						message.lines = mergeStructuredSourceLines(message.lines,
+							uncoveredStructuredSourceLines(image.sourceTextAnchors, []));
+						return message;
+					});
 				}
 				var direct = [];
 				var remaining = [];
@@ -3413,6 +3498,7 @@
 		readSelectedQuads: readSelectedQuads,
 		copyRecognizedSelection: copyRecognizedSelection,
 		copySelectionWithOcr: copySelectionWithOcr,
+		hasSevereTextBoxOverlap: hasSevereTextBoxOverlap,
 		pdfTextAnchors: pdfTextAnchors,
 		sourceFontForLine: sourceFontForLine,
 		extractedLatinLine: extractedLatinLine,
