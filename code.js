@@ -18,7 +18,7 @@
 	// Bump whenever code.js changes, and keep it in step with the ?v= query in
 	// index.html/config.json. A stale WebView cache silently keeps the old build,
 	// so the running build is shown in the panel header.
-	var PLUGIN_BUILD = "plu-no-export-32";
+	var PLUGIN_BUILD = "source-script-44";
 	var COPY_SELECTION_MENU_ID = "khmer-ocr-copy-selection";
 	var PARALLELISM_KEY = "typsastra.khmer-ocr.parallel-workers";
 
@@ -378,8 +378,33 @@
 				return { text: "ក", quads: quad };
 			}) }, image).sort(function (a, b) {
 			return quadBounds(a.quad).top - quadBounds(b.quad).top ||
-				quadBounds(a.quad).left - quadBounds(b.quad).left;
+			quadBounds(a.quad).left - quadBounds(b.quad).left;
 		});
+	}
+
+	function attachSourceTextToRegions(regions, selection, image) {
+		var sourceLines = selectionDetections(selection, image);
+		regions.forEach(function (region) {
+			var bounds = quadBounds(region.quad);
+			var area = Math.max(1, (bounds.right - bounds.left) * (bounds.bottom - bounds.top));
+			var best = null;
+			var bestOverlap = 0;
+			sourceLines.forEach(function (sourceLine) {
+				var sourceBounds = quadBounds(sourceLine.quad);
+				var overlap = Math.max(0, Math.min(bounds.right, sourceBounds.right) -
+					Math.max(bounds.left, sourceBounds.left)) *
+					Math.max(0, Math.min(bounds.bottom, sourceBounds.bottom) -
+					Math.max(bounds.top, sourceBounds.top));
+				var ratio = overlap / Math.min(area, Math.max(1,
+					(sourceBounds.right - sourceBounds.left) * (sourceBounds.bottom - sourceBounds.top)));
+				if (ratio > bestOverlap && sourceLine.sourceText) {
+					best = sourceLine;
+					bestOverlap = ratio;
+				}
+			});
+			if (best && bestOverlap >= 0.35) region.sourceText = best.sourceText;
+		});
+		return regions;
 	}
 
 	function documentName() {
@@ -882,6 +907,8 @@
 	// does not. Bound each recognizer crop by the halfway point to nearby runs
 	// in the same column. Preserve the unmodified quad for source-font matching.
 	function constrainSelectionCrops(detections, image) {
+		var pixels = image.rgba && image.rgba.byteLength === image.width * image.height * 4
+			? new Uint8ClampedArray(image.rgba) : null;
 		detections.forEach(function (detection) {
 			var bounds = quadBounds(detection.quad);
 			var height = bounds.bottom - bounds.top;
@@ -891,6 +918,8 @@
 			var center = (bounds.top + bounds.bottom) / 2;
 			var above = -Infinity;
 			var below = Infinity;
+			var aboveDivider = null;
+			var belowDivider = null;
 			detections.forEach(function (other) {
 				if (other === detection) return;
 				var neighbor = quadBounds(other.quad);
@@ -898,11 +927,19 @@
 					Math.max(bounds.left, neighbor.left));
 				if (overlap < Math.min(width, neighbor.right - neighbor.left) * 0.35) return;
 				var neighborCenter = (neighbor.top + neighbor.bottom) / 2;
-				if (neighborCenter < center - 2) above = Math.max(above, neighborCenter);
-				if (neighborCenter > center + 2) below = Math.min(below, neighborCenter);
+				if (neighborCenter < center - 2 && neighborCenter > above) {
+					above = neighborCenter;
+					aboveDivider = findInkDivider(pixels, image.width, overlapStart(bounds, neighbor),
+						overlapEnd(bounds, neighbor), neighborCenter, center);
+				}
+				if (neighborCenter > center + 2 && neighborCenter < below) {
+					below = neighborCenter;
+					belowDivider = findInkDivider(pixels, image.width, overlapStart(bounds, neighbor),
+						overlapEnd(bounds, neighbor), center, neighborCenter);
+				}
 			});
-			var top = Math.max(0, bounds.top, (above + center) / 2);
-			var bottom = Math.min(image.height, bounds.bottom, (below + center) / 2);
+			var top = Math.max(0, bounds.top, aboveDivider == null ? (above + center) / 2 : aboveDivider);
+			var bottom = Math.min(image.height, bounds.bottom, belowDivider == null ? (below + center) / 2 : belowDivider);
 			if (bottom - top < Math.max(4, height * 0.4) ||
 				(top <= bounds.top && bottom >= bounds.bottom)) return;
 			detection.cropQuad = {
@@ -911,6 +948,31 @@
 			};
 		});
 		return detections;
+	}
+
+	function overlapStart(a, b) { return Math.max(a.left, b.left); }
+	function overlapEnd(a, b) { return Math.min(a.right, b.right); }
+
+	function findInkDivider(pixels, imageWidth, left, right, centerA, centerB) {
+		if (!pixels || !(right > left)) return null;
+		var low = Math.ceil(Math.min(centerA, centerB) + Math.abs(centerB - centerA) * 0.2);
+		var high = Math.floor(Math.max(centerA, centerB) - Math.abs(centerB - centerA) * 0.2);
+		var x0 = Math.max(0, Math.ceil(left));
+		var x1 = Math.max(x0, Math.floor(right));
+		var width = x1 - x0 + 1;
+		var bestY = -1;
+		var bestInk = Infinity;
+		for (var y = low; y <= high; y++) {
+			var ink = 0;
+			for (var x = x0; x <= x1; x++) {
+				var offset = (y * imageWidth + x) * 4;
+				if (pixels[offset + 3] >= 128 &&
+					Math.max(pixels[offset], pixels[offset + 1], pixels[offset + 2]) < 170) ink++;
+			}
+			if (ink < bestInk) { bestInk = ink; bestY = y; }
+		}
+		return bestY >= 0 && bestInk <= Math.max(1, Math.floor(width * 0.05))
+			? bestY + 0.5 : null;
 	}
 
 	// Some embedded fonts report an advance much wider than their painted glyphs.
@@ -1019,7 +1081,7 @@
 		return total ? covered / total : 0;
 	}
 
-	/** Return the PDF's own text only when both its Unicode and font are credible. */
+	/** Return Latin PDF text when an independent text anchor agrees geometrically. */
 	function extractedLatinLine(detection, anchors) {
 		var text = String(detection.sourceText || "").replace(/[\s\uFFFF]+/g, " ").trim();
 		if (!/[A-Za-z\u00C0-\u024F]/.test(text) ||
@@ -1029,9 +1091,7 @@
 		var lineWidth = bounds.right - bounds.left;
 		var matchedWidth = 0;
 		anchors.forEach(function (anchor) {
-			var font = String(anchor.fontSourceName || "").replace(/^[A-Z]{6}\+/, "");
-			if (!/^(?:Times|Arial|Helvetica|Courier|Calibri|Cambria|Georgia|Garamond|Verdana|Tahoma|Liberation(?:Sans|Serif)|Noto(?:Sans|Serif)|Roboto|OpenSans|Inter)/i.test(font) ||
-				!anchor.bounds || !anchor.corruptText) return;
+			if (!anchor.bounds || !anchor.corruptText) return;
 			var fragment = String(anchor.corruptText).replace(/\s+/g, " ").trim();
 			if (!fragment || text.indexOf(fragment) === -1) return;
 			var rect = anchor.bounds;
@@ -1050,6 +1110,231 @@
 			source: "pdf-text",
 			order: detection.order
 		};
+	}
+
+	function hasStructuredLatin(text) {
+		text = String(text || "");
+		return /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(text) ||
+			/(?:https?:\/\/|www\.)[A-Z0-9.-]+\.[A-Z]{2,}(?:[/?#][A-Z0-9._~:/?#[\]@!$&'()*+,;=%-]*)?/i.test(text);
+	}
+
+	function hasMixedUnicode(text) {
+		text = String(text || "");
+		return /[\u1780-\u17FF]/.test(text) && /[A-Za-z]/.test(text) &&
+			/^[\u0020-\u007E\u1780-\u17FF\u00A0\u00AD\u200B-\u200F\u2010-\u201F\u2026\u20AC]*$/.test(text);
+	}
+
+	function isPluPdfMetadata(info) {
+		return !!info && info.Creator === PDF_RECONSTRUCTION_TOOL &&
+			String(info.Producer || "").indexOf(PDF_RECONSTRUCTION_TOOL + " using pdf-lib ") === 0;
+	}
+
+	function restoreNativeKhmerWhenOcrChangesScript(line, detection, isPlu) {
+		if (!isPlu) return line;
+		var source = String(detection && detection.sourceText || "").replace(/[\uFFFF\s]+/g, " ").trim();
+		var recognized = String(line && line.rawText || "");
+		var khmerCount = (source.match(/[\u1780-\u17FF]/g) || []).length;
+		if (khmerCount < 2 || /[\u1780-\u17FF]/.test(recognized) ||
+			/[^\u0020-\u007E\u1780-\u17FF\u00A0\u00AD\u200B-\u200F\u2010-\u201F\u2026\u20AC]/.test(source)) return line;
+		line.rawText = source;
+		line.units = [];
+		line.confidence = null;
+		line.source = "pdf-text";
+		return line;
+	}
+
+	function normalizedLatinText(text) {
+		var matches = String(text || "").match(/[A-Za-z\u00C0-\u024F\u1E00-\u1EFF0-9]+/g);
+		return matches ? matches.join("").toLowerCase() : "";
+	}
+
+	function editDistance(a, b) {
+		var previous = new Array(b.length + 1);
+		for (var j = 0; j <= b.length; j++) previous[j] = j;
+		for (var i = 1; i <= a.length; i++) {
+			var current = [i];
+			current[0] = i;
+			for (j = 1; j <= b.length; j++) {
+				current[j] = Math.min(current[j - 1] + 1, previous[j] + 1,
+					previous[j - 1] + (a.charAt(i - 1) === b.charAt(j - 1) ? 0 : 1));
+			}
+			previous = current;
+		}
+		return previous[b.length];
+	}
+
+	function sourceTextMatchesOcr(sourceText, recognizedText) {
+		var source = normalizedLatinText(sourceText);
+		var recognized = normalizedLatinText(recognizedText);
+		if (source.length < 4 || !recognized) return false;
+		return 1 - editDistance(source, recognized) / Math.max(source.length, recognized.length) >=
+			(source.length >= 12 ? 0.78 : 0.88);
+	}
+
+	/** Restore source Latin when text content, script context, or OCR agreement supports it. */
+	function restoreSourceLatin(line, detection, anchors) {
+		var units = line && Array.isArray(line.units) ? line.units : [];
+		var quad = line && (line.alignmentQuad || line.quad) || detection && detection.quad;
+		var totalSteps = Number(line && line.ctcContentLength);
+		if (!units.length || !quad || !quad.p0 || !quad.p1 || !Array.isArray(anchors) ||
+			!(totalSteps > 0)) return line;
+
+		var dx = quad.p1.x - quad.p0.x;
+		var dy = quad.p1.y - quad.p0.y;
+		var axisLengthSquared = dx * dx + dy * dy;
+		if (!(axisLengthSquared > 0)) return line;
+		var bounds = quadBounds(detection && detection.cropQuad || detection && detection.quad || quad);
+		var replacements = [];
+		anchors.forEach(function (anchor) {
+			if (!anchor || !anchor.bounds) return;
+
+			var overlapX = Math.max(0, Math.min(bounds.right, anchor.bounds.right) -
+				Math.max(bounds.left, anchor.bounds.left));
+			var overlapY = Math.max(0, Math.min(bounds.bottom, anchor.bounds.bottom) -
+				Math.max(bounds.top, anchor.bounds.top));
+			if (overlapY <= 0 || overlapX < Math.min(anchor.bounds.right - anchor.bounds.left,
+				bounds.right - bounds.left) * 0.65) return;
+			var baselineStart = anchor.baselineStart || {
+				x: anchor.bounds.left, y: (anchor.bounds.top + anchor.bounds.bottom) / 2
+			};
+			var baselineEnd = anchor.baselineEnd || {
+				x: anchor.bounds.right, y: (anchor.bounds.top + anchor.bounds.bottom) / 2
+			};
+			latinSourceFragments(anchor).forEach(function (fragment) {
+				if (!hasStructuredLatin(fragment.text) &&
+					!sourceTextMatchesOcr(fragment.text, line.rawText)) return;
+				var startPoint = interpolatePoint(baselineStart, baselineEnd, fragment.start);
+				var endPoint = interpolatePoint(baselineStart, baselineEnd, fragment.end);
+				if (!startPoint || !endPoint) return;
+				var start = Math.max(0, Math.min(1, ((startPoint.x - quad.p0.x) * dx +
+					(startPoint.y - quad.p0.y) * dy) / axisLengthSquared));
+				var end = Math.max(0, Math.min(1, ((endPoint.x - quad.p0.x) * dx +
+					(endPoint.y - quad.p0.y) * dy) / axisLengthSquared));
+				if (end < start) { var swap = start; start = end; end = swap; }
+				if (end <= start) return;
+				var first = -1;
+				var last = -1;
+				units.forEach(function (unit, index) {
+					var unitStart = Number(unit.timestepStart);
+					var unitEnd = Number(unit.timestepEnd);
+					if (!Number.isFinite(unitStart) || !Number.isFinite(unitEnd)) return;
+					var midpoint = (unitStart + unitEnd) / 2 / totalSteps;
+					if (midpoint >= start && midpoint <= end) {
+						if (first < 0) first = index;
+						last = index;
+					}
+				});
+				if (first >= 0) replacements.push({ first: first, last: last, text: fragment.text });
+			});
+		});
+
+		replacements.sort(function (a, b) { return b.first - a.first; });
+		var restored = units.map(function (unit) { return unit.rawText || "" });
+		var previousFirst = units.length;
+		replacements.forEach(function (replacement) {
+			if (replacement.last >= previousFirst) return;
+			restored.splice(replacement.first, replacement.last - replacement.first + 1, replacement.text);
+			previousFirst = replacement.first;
+		});
+		if (replacements.length) line.rawText = restored.join("");
+		return line;
+	}
+
+	function interpolatePoint(start, end, amount) {
+		if (!start || !end || !Number.isFinite(amount)) return null;
+		return { x: start.x + (end.x - start.x) * amount,
+			y: start.y + (end.y - start.y) * amount };
+	}
+
+	function latinSourceFragments(anchor) {
+		var text = String(anchor && anchor.corruptText || "");
+		if (!/[A-Za-z\u00C0-\u024F]/.test(text)) return [];
+		if (!/[^\u0020-\u007E\u00C0-\u024F\u1E00-\u1EFF\u2010-\u201F\u2026\u20AC]/.test(text)) {
+			var clean = text.replace(/[\s\uFFFF]+/g, " ").trim();
+			return clean ? [{ text: clean, start: 0, end: 1 }] : [];
+		}
+		var fractions = anchor.characterFractions;
+		var fragments = [];
+		var pattern = /[A-Za-z\u00C0-\u024F\u1E00-\u1EFF][A-Za-z0-9\u00C0-\u024F\u1E00-\u1EFF@._%+:/?&=#~\-]*/g;
+		var match;
+		while ((match = pattern.exec(text))) {
+			var start = fractions && Number.isFinite(fractions[match.index])
+				? fractions[match.index] : match.index / Math.max(1, text.length);
+			var endIndex = match.index + match[0].length;
+			var end = fractions && Number.isFinite(fractions[endIndex])
+				? fractions[endIndex] : endIndex / Math.max(1, text.length);
+			fragments.push({ text: match[0], start: start, end: end });
+		}
+		return fragments;
+	}
+
+	function uncoveredStructuredSourceLines(anchors, detections) {
+		var result = [];
+		if (!Array.isArray(anchors)) return result;
+		anchors.forEach(function (anchor) {
+			if (!anchor || !anchor.quad || !anchor.bounds) return;
+			latinSourceFragments(anchor).forEach(function (fragment) {
+				if (!hasStructuredLatin(fragment.text)) return;
+				var sourceBounds = anchor.bounds;
+				var sourceArea = Math.max(1, (sourceBounds.right - sourceBounds.left) *
+					(sourceBounds.bottom - sourceBounds.top));
+				var covered = (detections || []).some(function (detection) {
+					var bounds = quadBounds(detection.cropQuad || detection.quad);
+					var overlap = Math.max(0, Math.min(sourceBounds.right, bounds.right) -
+						Math.max(sourceBounds.left, bounds.left)) *
+						Math.max(0, Math.min(sourceBounds.bottom, bounds.bottom) -
+						Math.max(sourceBounds.top, bounds.top));
+					return overlap / sourceArea >= 0.45;
+				});
+				if (covered) return;
+				var start = interpolatePoint(anchor.baselineStart, anchor.baselineEnd, fragment.start);
+				var end = interpolatePoint(anchor.baselineStart, anchor.baselineEnd, fragment.end);
+				var quad = anchor.quad;
+				if (start && end && anchor.baselineStart && anchor.baselineEnd) {
+					var topStart = interpolatePoint(quad.p0, quad.p1, fragment.start);
+					var topEnd = interpolatePoint(quad.p0, quad.p1, fragment.end);
+					var bottomStart = interpolatePoint(quad.p3, quad.p2, fragment.start);
+					var bottomEnd = interpolatePoint(quad.p3, quad.p2, fragment.end);
+					if (topStart && topEnd && bottomStart && bottomEnd) {
+						quad = { p0: topStart, p1: topEnd, p2: bottomEnd, p3: bottomStart };
+					}
+				}
+				result.push({
+					detectionId: anchor.id,
+					quad: quad,
+					units: [],
+					rawText: fragment.text,
+					confidence: null,
+					source: "pdf-text",
+					order: { region: 0, line: anchor.id || 0, position: 0 }
+				});
+			});
+		});
+		return result;
+	}
+
+	function mergeStructuredSourceLines(lines, sourceLines) {
+		var result = (lines || []).slice();
+		(sourceLines || []).forEach(function (sourceLine) {
+			var sourceBounds = quadBounds(sourceLine.quad);
+			var sourceArea = Math.max(1, (sourceBounds.right - sourceBounds.left) *
+				(sourceBounds.bottom - sourceBounds.top));
+			var alreadyCovered = result.some(function (line) {
+				if (!line.quad) return false;
+				var bounds = quadBounds(line.quad);
+				var overlap = Math.max(0, Math.min(sourceBounds.right, bounds.right) -
+					Math.max(sourceBounds.left, bounds.left)) *
+					Math.max(0, Math.min(sourceBounds.bottom, bounds.bottom) -
+					Math.max(sourceBounds.top, bounds.top));
+				return overlap / sourceArea >= 0.45;
+			});
+			if (!alreadyCovered) result.push(sourceLine);
+		});
+		return result.sort(function (a, b) {
+			var boundsA = quadBounds(a.quad);
+			var boundsB = quadBounds(b.quad);
+			return boundsA.top - boundsB.top || boundsA.left - boundsB.left;
+		});
 	}
 
 	/* -------------------------------------------------------------- OCR driver */
@@ -1186,11 +1471,20 @@
 				if (!bytes) throw new Error("original PDF bytes unavailable (" + commandError + ")");
 				return loadPdfJs().then(function (pdfjs) {
 					return pdfjs.getDocument({ data: bytes }).promise.then(function (pdfDocument) {
-						return {
-							kind: "pdf.js",
-							render: function (index) { return renderPdfJsPage(pdfDocument, index, sizes); },
-							destroy: function () { try { pdfDocument.destroy(); } catch (error) {} }
-						};
+						return pdfDocument.getMetadata().catch(function () { return null; }).then(function (metadata) {
+							var isPlu = isPluPdfMetadata(metadata && metadata.info);
+							return {
+								kind: "pdf.js",
+								isPlu: isPlu,
+								render: function (index) {
+									return renderPdfJsPage(pdfDocument, index, sizes).then(function (image) {
+										image.isPlu = isPlu;
+										return image;
+									});
+								},
+								destroy: function () { try { pdfDocument.destroy(); } catch (error) {} }
+							};
+						});
 					});
 				});
 			})
@@ -1326,11 +1620,21 @@
 						return renderer.render(page.index).then(function (image) {
 							var regions = selectedDetections(page, image);
 							if (!regions.length) throw new Error("Selected text has no usable PDF geometry");
-							return ocrPage(page.index, image, regions).then(function (message) {
-								var text = (message.lines || []).map(function (line) {
-									return line.rawText || "";
-								}).filter(Boolean).join("\n");
-								if (text) results.push(text);
+							return readSelectionGeometry(page.index).then(function (sourceSelection) {
+								attachSourceTextToRegions(regions, sourceSelection, image);
+								return ocrPage(page.index, image, regions).then(function (message) {
+									(message.lines || []).forEach(function (line) {
+										var detection = regions.filter(function (region) {
+										return region.id === line.detectionId;
+										})[0];
+									restoreNativeKhmerWhenOcrChangesScript(line, detection, image.isPlu);
+									restoreSourceLatin(line, detection, image.sourceTextAnchors);
+									});
+									var text = (message.lines || []).map(function (line) {
+										return line.rawText || "";
+									}).filter(Boolean).join("\n");
+									if (text) results.push(text);
+								});
 							});
 						});
 					});
@@ -1481,7 +1785,16 @@
 			})
 			.then(function (selection) {
 				var detections = selectionDetections(selection, image);
-				if (!detections.length) return ocrPage(pageIndex, image, []);
+				if (!detections.length) {
+					var sourceLines = uncoveredStructuredSourceLines(image.sourceTextAnchors, []);
+					return ocrPage(pageIndex, image, []).then(function (message) {
+						(message.lines || []).forEach(function (line) {
+							restoreSourceLatin(line, null, image.sourceTextAnchors);
+						});
+						message.lines = mergeStructuredSourceLines(message.lines, sourceLines);
+						return message;
+					});
+				}
 				var inkCoverage = selectionInkCoverage(detections, image);
 				if (inkCoverage !== null && inkCoverage < 0.4) {
 					geometrySource = "PP-OCR detector (scanned page)";
@@ -1491,6 +1804,7 @@
 				}
 				var direct = [];
 				var remaining = [];
+				var sourceLines = uncoveredStructuredSourceLines(image.sourceTextAnchors, detections);
 				detections.forEach(function (detection) {
 					var extracted = extractedLatinLine(detection, image.sourceTextAnchors);
 					if (extracted) direct.push(extracted);
@@ -1498,21 +1812,29 @@
 				});
 				geometrySource = direct.length
 					? (remaining.length ? "PDF text + selection" : "PDF text") : "PDF selection";
-				if (!remaining.length) return { lines: direct };
+				if (!remaining.length) return { lines: mergeStructuredSourceLines(direct, sourceLines) };
 				return ocrPage(pageIndex, image, remaining).then(function (message) {
 					var recognized = message.lines || [];
 					if (recognized.some(function (line) { return line.rawText && line.rawText.trim(); })) {
-						recognized.forEach(function (line) { line.source = "pdf-selection"; });
-						message.lines = direct.concat(recognized).sort(function (a, b) {
-							return a.order.line - b.order.line;
+						recognized.forEach(function (line) {
+							var detection = remaining.filter(function (region) {
+								return region.id === line.detectionId;
+							})[0];
+							restoreNativeKhmerWhenOcrChangesScript(line, detection, image.isPlu);
+							restoreSourceLatin(line, detection, image.sourceTextAnchors);
+							line.source = "pdf-selection";
 						});
+						message.lines = mergeStructuredSourceLines(direct.concat(recognized), sourceLines);
 						return message;
 					}
 					// An unrelated/invisible layer may have selectable boxes but no ink.
 					// Retry image detection, keeping the proven Latin source text.
 					geometrySource = direct.length ? "PDF text + PP-OCR detector" : "PP-OCR detector";
 					return ocrPage(pageIndex, image, []).then(function (fallback) {
-						fallback.lines = direct.concat((fallback.lines || []).filter(function (line) {
+						(fallback.lines || []).forEach(function (line) {
+							restoreSourceLatin(line, null, image.sourceTextAnchors);
+						});
+						fallback.lines = mergeStructuredSourceLines(direct.concat((fallback.lines || []).filter(function (line) {
 							var rect = quadBounds(line.quad);
 							return !direct.some(function (original) {
 								var saved = quadBounds(original.quad);
@@ -1520,9 +1842,7 @@
 									Math.max(0, Math.min(rect.bottom, saved.bottom) - Math.max(rect.top, saved.top));
 								return intersection > (rect.right - rect.left) * (rect.bottom - rect.top) * 0.5;
 							});
-						})).sort(function (a, b) {
-							return quadBounds(a.quad).top - quadBounds(b.quad).top;
-						});
+						})), sourceLines);
 						return fallback;
 					});
 				});
@@ -1601,6 +1921,41 @@
 		return Math.hypot(point.x - (start.x + t * dx), point.y - (start.y + t * dy));
 	}
 
+	function textCharacterFractions(text, font) {
+		var characters = Array.from(String(text || ""));
+		if (!characters.length) return [0];
+		var widths = null;
+		try {
+			if (font && typeof font.charsToGlyphs === "function") {
+				var glyphs = font.charsToGlyphs(text);
+				if (glyphs && glyphs.length === characters.length) {
+					widths = glyphs.map(function (glyph) {
+						return Math.max(0, Number(glyph && glyph.width) || 0);
+					});
+				}
+			}
+		} catch (error) {
+			widths = null;
+		}
+		if (!widths || !widths.some(function (width) { return width > 0; })) {
+			widths = characters.map(function () { return 1; });
+		}
+		var total = widths.reduce(function (sum, width) { return sum + width; }, 0);
+		var fractions = new Array(String(text).length + 1);
+		var cumulative = 0;
+		var offset = 0;
+		fractions[0] = 0;
+		characters.forEach(function (character, index) {
+			var width = widths[index] / total;
+			for (var i = 1; i <= character.length; i++) {
+				fractions[offset + i] = cumulative + width * i / character.length;
+			}
+			offset += character.length;
+			cumulative += width;
+		});
+		return fractions;
+	}
+
 	/**
 	 * Text anchors extracted from the PDF's own text via pdf.js (raster space).
 	 */
@@ -1608,6 +1963,7 @@
 		var items = (textContent && textContent.items) ? textContent.items : [];
 		var anchors = [];
 		var fontNames = {};
+		var fontObjects = {};
 		for (var index = 0; index < items.length; index++) {
 			var item = items[index];
 			if (!item || !item.str || !Array.isArray(item.transform)) continue;
@@ -1616,8 +1972,10 @@
 					// styles[item.fontName].fontFamily is often only "sans-serif".
 					// After render, the actual PDF subset name is in commonObjs.
 					var font = pdfPage.commonObjs.get(item.fontName);
+					fontObjects[item.fontName] = font || null;
 					fontNames[item.fontName] = font && font.name || "";
 				} catch (error) {
+					fontObjects[item.fontName] = null;
 					fontNames[item.fontName] = "";
 				}
 			}
@@ -1640,6 +1998,7 @@
 			anchors.push({
 				id: index,
 				corruptText: item.str,
+				characterFractions: textCharacterFractions(item.str, fontObjects[item.fontName]),
 				fontSourceName: fontNames[item.fontName],
 				width: width,
 				height: height,
@@ -3056,6 +3415,10 @@
 		copySelectionWithOcr: copySelectionWithOcr,
 		pdfTextAnchors: pdfTextAnchors,
 		sourceFontForLine: sourceFontForLine,
-		extractedLatinLine: extractedLatinLine
+		extractedLatinLine: extractedLatinLine,
+		restoreSourceLatin: restoreSourceLatin,
+		restoreNativeKhmerWhenOcrChangesScript: restoreNativeKhmerWhenOcrChangesScript,
+		isPluPdfMetadata: isPluPdfMetadata,
+		pdfReconstructionTool: PDF_RECONSTRUCTION_TOOL
 	};
 })(window, undefined);
